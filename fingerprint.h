@@ -1,12 +1,51 @@
+// fingerprint.h
 #ifndef FINGERPRINT_H
 #define FINGERPRINT_H
 
 #include <Arduino.h>
 
-// Starts the UART serial connection and checks if the sensor is responding
-bool initFingerprint();
+// Called once per failed init attempt, before the next retry, so the
+// caller (AttendX.ino) can update the LCD without fingerprint.cpp
+// needing to know anything about ui.h.
+typedef void (*WarningCallback)(int attemptNumber, int maxAttempts);
 
-// Non-blocking poll. Returns the matched slot number (e.g., 1, 2, 3) or 0 if no match
+// Called at each step of enrollment so the caller can update the LCD,
+// e.g. onPrompt("Place Finger", ""), onPrompt("Remove Finger", "").
+typedef void (*EnrollPromptCallback)(const char* line1, const char* line2);
+
+bool initFingerprint(WarningCallback onRetryWarning);
+bool isFingerprintAvailable();
+
+// Non-blocking poll.
+//  > 0  → matched slot ID
+//    0  → no finger present, or finger read but no match
+//   -1  → sensor communication error (distinct from "no match", for logging)
 int checkFingerprint();
+
+enum EnrollResult {
+  ENROLL_OK,
+  ENROLL_TIMEOUT,
+  ENROLL_BAD_IMAGE,
+  ENROLL_MISMATCH,       // the two scans didn't match each other
+  ENROLL_DUPLICATE,      // this finger is already enrolled elsewhere
+  ENROLL_STORE_FAILED,
+  ENROLL_NO_FREE_SLOT
+};
+
+// Human-readable code for telemetry/logging, e.g. "duplicate_finger" —
+// matches the errorReason values the backend expects.
+const char* enrollResultToString(EnrollResult result);
+
+// Asks the sensor directly (not a locally tracked list) for the lowest
+// unused slot ID, 1-indexed. Returns 0 if the sensor is full.
+int findNextFreeSlot();
+
+// Runs the full two-scan enrollment into `slot`. Blocking, with a
+// per-step timeout so it can never hang forever. Checks for duplicates
+// against the existing database before storing.
+EnrollResult enrollFingerprint(int slot, EnrollPromptCallback onPrompt);
+
+// Deletes the template at `slot`. Returns true on success.
+bool deleteFingerprint(int slot);
 
 #endif

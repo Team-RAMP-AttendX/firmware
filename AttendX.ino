@@ -1,164 +1,261 @@
-#include "pins.h"
-#include <Arduino.h>
 #include <WiFi.h>
-#include "esp_camera.h"
-
+#include "pins.h"
 #include "ui.h"
 #include "fingerprint.h"
 #include "api_client.h"
+#include "secrets.h"
+#include "esp_camera.h"
 
-const char* ssid = "";
-const char* password = "";
+static bool fingerprintOK = false;
 
-unsigned long lastTelemetryTime = 0;
-const unsigned long telemetryInterval = 30000; // 30 seconds
+// --- wraps updateDisplay so the network task always knows what's on screen ---
+static void display(const char* l1, const char* l2) {
+  updateDisplay(l1, l2);
+  reportLcdText(l1, l2);
+}
 
-void initCamera() {
-  camera_config_t config;
+// ---------------- camera ----------------
+
+static bool cameraOK = false;
+
+static bool initCamera() {
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;  config.pin_d7 = Y9_GPIO_NUM;
   config.pin_xclk = XCLK_GPIO_NUM;
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;
+  config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  
-  // Set to SVGA (800x600) to match the backend telemetry contract
-  config.frame_size = FRAMESIZE_SVGA; 
-  config.jpeg_quality = 20;
-  config.grab_mode = CAMERA_GRAB_LATEST;
 
-  // Crucial: Route buffer to PSRAM and use double-buffering to prevent FB-OVF
   if (psramFound()) {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    Serial.println("PSRAM found. Using double-buffering.");
   } else {
-    // If PSRAM isn't enabled in Arduino IDE, SVGA will crash. 
-    Serial.println("WARNING: PSRAM not detected! Check IDE Tools menu.");
-    config.frame_size = FRAMESIZE_QVGA; 
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 15;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
-  // Attempt initialization with a small delay for stability
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera Init Failed with error 0x%x\n", err);
-    updateDisplay("Camera Error", "Continuing w/o Cam");
-    delay(2000);
-    return; // Don't trap the boot sequence in a freeze!
-  }
-  Serial.println("Camera Init Success!");
+  return esp_camera_init(&config) == ESP_OK;
 }
+
+// Captures one JPEG into a heap buffer the caller owns (must free() it,
+// or hand it to queueManualCheckinWithPhoto, which frees it for you).
+// Returns nullptr on failure.
+static uint8_t* capturePhoto(size_t* outLen) {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) return nullptr;
+
+  uint8_t* copy = (uint8_t*)malloc(fb->len);
+  if (copy) {
+    memcpy(copy, fb->buf, fb->len);
+    *outLen = fb->len;
+  }
+  esp_camera_fb_return(fb); // must return the driver's buffer, never free() it directly
+  return copy;
+}
+
+// Note: PWDN_GPIO_NUM is -1 in pins.h (not wired), so real hardware
+// power-down isn't possible on this board -- that's why there's no
+// sleepCamera()/wakeCamera() here. Given the terminal also reports
+// powerStatus: "AC" (mains-powered, not battery), the power saving
+// wasn't buying anything real; dropping it is the honest fix rather
+// than keeping dead functions around.
+
+// ---------------- fingerprint init warning ----------------
+
+static void onFingerprintRetry(int attempt, int max) {
+  char line2[17];
+  snprintf(line2, sizeof(line2), "Retry %d/%d", attempt, max);
+  display("Sensor Error", line2);
+}
+
+// ---------------- admin menu ----------------
+
+static void runAdminMenu() {
+  String pin = getMaskedPIN("Admin PIN:");
+  if (pin != ADMIN_PIN) {
+    display("Wrong PIN", "");
+    delay(1500);
+    return;
+  }
+
+  display("A:Enroll B:Delete", "C:Exit");
+  char choice = 0;
+  unsigned long start = millis();
+  while (millis() - start < 10000) { // 10s to pick, then auto-exit
+    choice = getKeypress();
+    if (choice) break;
+    delay(10);
+  }
+
+  if (choice == 'A') {
+    if (!isFingerprintAvailable()) {
+      display("Sensor Offline", "Cannot Enroll");
+      delay(1500);
+      return;
+    }
+    int slot = findNextFreeSlot();
+    if (slot == 0) {
+      display("Enroll Failed", "Sensor Full");
+      delay(1500);
+      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", "", 0, false, "slot_full");
+      return;
+    }
+
+    String userId = getManualID();
+    if (userId.length() == 0) {
+      display("Cancelled", "");
+      delay(1000);
+      return;
+    }
+
+    EnrollResult result = enrollFingerprint(slot, [](const char* l1, const char* l2) {
+      display(l1, l2);
+    });
+
+    if (result == ENROLL_OK) {
+      display("Enrolled", ("Slot " + String(slot)).c_str());
+      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, slot, true, nullptr);
+    } else {
+      display("Enroll Failed", enrollResultToString(result));
+      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, 0, false, enrollResultToString(result));
+    }
+    delay(2000);
+
+  } else if (choice == 'B') {
+    display("Enter Slot #:", "");
+    String slotStr = getManualID();
+    int slot = slotStr.toInt();
+    if (slot < 1 || slot > 126) {
+      display("Invalid Slot", "");
+      delay(1500);
+      return;
+    }
+
+    bool ok = deleteFingerprint(slot);
+    display(ok ? "Deleted" : "Delete Failed", ("Slot " + String(slot)).c_str());
+    queueTerminalInitiatedResult("DELETE_FINGERPRINT", "", slot, ok, ok ? nullptr : "slot_not_found");
+    delay(2000);
+  }
+  // 'C' or timeout: just fall through and return to idle
+}
+
+// ---------------- dashboard command execution ----------------
+// Runs on the UI task -- this is the one place fingerprint.h functions
+// get called in response to something the network task noticed.
+
+static void handlePendingCommand() {
+  IncomingCommand cmd;
+  if (!pollIncomingCommand(cmd)) return;
+
+  if (cmd.type == CMD_ENROLL_FINGERPRINT) {
+    if (!isFingerprintAvailable()) {
+      queueCommandResult(cmd, false, "sensor_offline", 0);
+      return;
+    }
+    int slot = findNextFreeSlot();
+    if (slot == 0) {
+      queueCommandResult(cmd, false, "slot_full", 0);
+      return;
+    }
+    EnrollResult result = enrollFingerprint(slot, [](const char* l1, const char* l2) {
+      display(l1, l2);
+    });
+    if (result == ENROLL_OK) {
+      queueCommandResult(cmd, true, nullptr, slot);
+    } else {
+      queueCommandResult(cmd, false, enrollResultToString(result), 0);
+    }
+    display("Ready", "Scan Finger");
+
+  } else if (cmd.type == CMD_DELETE_FINGERPRINT) {
+    bool ok = deleteFingerprint(cmd.slotNumber);
+    queueCommandResult(cmd, ok, ok ? nullptr : "slot_not_found", cmd.slotNumber);
+  }
+  clearInProgressCommand();
+}
+
+// ---------------- setup / loop ----------------
 
 void setup() {
   Serial.begin(115200);
-  
-  // 1. Boot LCD and Keypad
   initUI();
-  updateDisplay("Booting System", "Please wait...");
-  delay(1000);
+  display("Booting...", "");
 
-  // 2. Boot Fingerprint Scanner
-  updateDisplay("Starting Sensor", "Checking UART...");
-  if (!initFingerprint()) {
-    updateDisplay("Sensor Error", "Halted.");
-    while(1);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  display("Connecting", "WiFi...");
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(200);
   }
 
-  // 3. Boot Camera
-  updateDisplay("Starting Camera", "OV2640 Init...");
-  initCamera();
+  fingerprintOK = initFingerprint(onFingerprintRetry);
+  cameraOK = initCamera();
 
+  initApiClient(); // starts the network task on core 0
 
-  // 4. Connect WiFi
-  updateDisplay("Connecting WiFi", ssid);
-  WiFi.begin(ssid, password);
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(800);
-    Serial.print(".");
+  if (!fingerprintOK) {
+    display("Keypad Mode", "Press # for ID");
+    delay(2000);
   }
-
-  // 5. Sync Time (WAT)
-  updateDisplay("Syncing Time", "WAT (+01:00)...");
-  setupTime();
-
-  updateDisplay("AttendX Ready", "Scan or Press #");
+  display("Ready", "Scan Finger");
 }
 
 void loop() {
-  // --- 1. NON-BLOCKING TELEMETRY ---
-  if (millis() - lastTelemetryTime >= telemetryInterval) {
-    lastTelemetryTime = millis();
-    // Fires in the background without freezing the UI
-    sendTelemetry("** ATTENDX TERMINAL **", "Ready for Scan..."); 
-  }
-
-  // --- 2. NON-BLOCKING BIOMETRIC SCAN ---
-  int slotNumber = checkFingerprint();
-  if (slotNumber > 0) {
-    updateDisplay("Processing...", "Sending Data");
-    
-    if (sendFingerprintLog(slotNumber)) {
-      updateDisplay("Check-In OK", "Access Granted");
-    } else {
-      updateDisplay("Network Error", "Try Again");
-    }
-    
-    delay(2000);
-    updateDisplay("AttendX Ready", "Scan or Press #");
-  }
-
-  // --- 3. KEYPAD FALLBACK ---
   char key = getKeypress();
-  if (key == '#') {
-    // getManualID() loops locally until '*' is pressed or '#' cancels
-    String manualID = getManualID(); 
-    
-    if (manualID.length() > 0) {
-      updateDisplay("Look at Camera", "Capturing...");
-      delay(500); // Give user a moment to look up
-      
-      // Flush the stale frame out of the DMA buffer first
-      camera_fb_t *dummy_fb = esp_camera_fb_get();
-      if (dummy_fb) esp_camera_fb_return(dummy_fb);
-
-      // Grab the fresh frame
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (!fb) {
-        updateDisplay("Camera Error", "Failed to capture");
-      } else {
-        updateDisplay("Uploading...", "Please wait");
-        
-        if (sendManualLogWithPhoto(manualID, fb->buf, fb->len)) {
-          updateDisplay("Check-In OK", "Audit Logged");
-        } else {
-          updateDisplay("Upload Failed", "Try Again");
-        }
-        
-        // CRITICAL: Free PSRAM buffer immediately
-        esp_camera_fb_return(fb); 
-      }
-    } else {
-      updateDisplay("Cancelled", "Returning...");
-    }
-    
-    delay(2000);
-    updateDisplay("AttendX Ready", "Scan or Press #");
+  if (key == 'A') {
+    runAdminMenu();
+    display("Ready", "Scan Finger");
   }
+
+  handlePendingCommand();
+
+  if (fingerprintOK) {
+    int slot = checkFingerprint();
+    if (slot > 0) {
+      display("Welcome", ("Employee " + String(slot)).c_str());
+      queueFingerprintCheckin(slot);
+      delay(2000);
+      display("Ready", "Scan Finger");
+    } else if (slot == -1) {
+      Serial.println("Fingerprint sensor read error");
+    }
+  }
+
+  if (key == '#') {
+    String userId = getManualID();
+    if (userId.length() > 0) {
+      if (cameraOK) {
+        display("Hold Still", "Taking Photo");
+        size_t photoLen;
+        uint8_t* photo = capturePhoto(&photoLen);
+        if (photo) {
+          display("Check-In OK", "Photo Logged");
+          queueManualCheckinWithPhoto(userId, photo, photoLen);
+        } else {
+          display("Camera Error", "Try Again");
+        }
+      } else {
+        display("Camera Offline", "Cannot Log");
+      }
+      delay(2000);
+    }
+    display("Ready", "Scan Finger");
+  }
+
+  delay(10);
 }

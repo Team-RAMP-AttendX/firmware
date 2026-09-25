@@ -2,117 +2,218 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
-const char* host = "atendx.ai.studio";
-const String deviceId = "DEV_TERM_01";
+static const char* host = "atendx.ai.studio";
+static const char* deviceId = "DEV_TERM_01";
+static const char* BUFFER_DIR = "/buf";
 
-void setupTime() {
-  // 3600 seconds = +1 hour offset for WAT, 0 daylight saving time
+static QueueHandle_t outboundQueue;
+static QueueHandle_t inboundCommandQueue;
+static char inProgressCommandId[COMMANDID_MAX_LEN] = "";
+static uint32_t nextBufferSeq = 1;
+
+// ---------- time ----------
+
+static void setupTime() {
   configTime(3600, 0, "pool.ntp.org", "time.nist.gov");
-  
-  Serial.print("Syncing time");
   time_t now = time(nullptr);
-  while (now < 100000) { // Wait until time is valid
-    delay(500);
-    Serial.print(".");
+  while (now < 100000) {
+    vTaskDelay(pdMS_TO_TICKS(500));
     now = time(nullptr);
   }
-  Serial.println(" Time synced!");
 }
 
-String getISOTimestamp() {
+static String getISOTimestamp() {
   time_t now;
   struct tm timeinfo;
   time(&now);
   localtime_r(&now, &timeinfo);
-  
-  char buf[30];
-  // Format: 2026-09-21T08:52:14.000Z
+  char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000+01:00", &timeinfo);
   return String(buf);
 }
 
-bool sendTelemetry(String lcdLine1, String lcdLine2) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  
-  HTTPClient http;
-  http.begin("https://atendx.ai.studio/api/devices/telemetry");
-  http.addHeader("Content-Type", "application/json");
+// ---------- LCD text snapshot (cross-core, critical-section protected) ----------
 
-  // Build the 2-line JSON payload using dummy hardware metrics for the demo
-  String payload = "{";
-  payload += "\"deviceId\":\"" + deviceId + "\",";
-  payload += "\"wifiStatus\":\"Connected\",";
-  payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  payload += "\"ipAddress\":\"" + WiFi.localIP().toString() + "\",";
-  payload += "\"powerStatus\":\"AC\",";
-  payload += "\"batteryStatus\":100,";
-  payload += "\"esp32Heap\":\"" + String(ESP.getFreeHeap() / 1024) + " KB Free\",";
-  payload += "\"lcdText\":[\"" + lcdLine1 + "\",\"" + lcdLine2 + "\"]";
-  payload += "}";
+static portMUX_TYPE lcdMux = portMUX_INITIALIZER_UNLOCKED;
+static char lastLcdLine1[17] = "Booting";
+static char lastLcdLine2[17] = "";
 
-  int httpCode = http.POST(payload);
-  http.end();
-  return (httpCode >= 200 && httpCode < 300);
+void reportLcdText(const char* line1, const char* line2) {
+  portENTER_CRITICAL(&lcdMux);
+  strncpy(lastLcdLine1, line1, 16);
+  strncpy(lastLcdLine2, line2, 16);
+  portEXIT_CRITICAL(&lcdMux);
 }
 
-bool sendFingerprintLog(int slotNumber) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  
-  HTTPClient http;
-  http.begin("https://atendx.ai.studio/api/attendance/checkin");
-  http.addHeader("Content-Type", "application/json");
-
-  String payload = "{";
-  payload += "\"deviceId\":\"" + deviceId + "\",";
-  payload += "\"slotNumber\":" + String(slotNumber) + ",";
-  payload += "\"authMode\":\"fingerprint\",";
-  payload += "\"timestamp\":\"" + getISOTimestamp() + "\",";
-  payload += "\"offlineBuffered\":false";
-  payload += "}";
-
-  int httpCode = http.POST(payload);
-  http.end();
-  return (httpCode >= 200 && httpCode < 300);
+static void getLcdTextSnapshot(char* out1, char* out2) {
+  portENTER_CRITICAL(&lcdMux);
+  strncpy(out1, lastLcdLine1, 17);
+  strncpy(out2, lastLcdLine2, 17);
+  portEXIT_CRITICAL(&lcdMux);
 }
 
-bool sendManualLogWithPhoto(String manualID, uint8_t* imageBuf, size_t imageLen) {
+// ---------- command in-progress dedup ----------
+// Cleared by clearInProgressCommand() once the UI task finishes locally
+// executing a command -- deliberately NOT tied to whether the result
+// report reaches the backend, since that's a separate concern (retried
+// via the offline buffer if needed) and gating on it risks getting
+// permanently stuck if that first report attempt fails.
+
+void clearInProgressCommand() {
+  inProgressCommandId[0] = '\0';
+}
+
+// ---------- bounded HTTP helper ----------
+
+static bool httpPostJson(const char* url, const String& body, String* respOut = nullptr) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  // 1. First, send the check-in event so the backend creates the attendance record
-  HTTPClient http;
-  http.begin("https://atendx.ai.studio/api/attendance/checkin");
-  http.addHeader("Content-Type", "application/json");
-  
-  String checkinPayload = "{";
-  checkinPayload += "\"deviceId\":\"" + deviceId + "\",";
-  checkinPayload += "\"userId\":\"" + manualID + "\",";
-  checkinPayload += "\"authMode\":\"pin\",";
-  checkinPayload += "\"timestamp\":\"" + getISOTimestamp() + "\",";
-  checkinPayload += "\"offlineBuffered\":false";
-  checkinPayload += "}";
-  
-  int checkinCode = http.POST(checkinPayload);
-  http.end();
-  
-  if (checkinCode < 200 || checkinCode >= 300) return false;
-
-  // 2. Stream the evidence photo via multipart/form-data
   WiFiClientSecure client;
-  client.setInsecure(); // Bypass SSL check for hackathon speed
-  
+  client.setInsecure();     // TODO: pin the real CA cert before this leaves the demo
+  client.setTimeout(5000);
+
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(body);
+  bool ok = (code >= 200 && code < 300);
+  if (ok && respOut) *respOut = http.getString();
+  http.end();
+  return ok;
+}
+
+// ---------- shared checkin JSON builder ----------
+// Used both by the normal send path and the queue-full fallback, so
+// there's exactly one place that knows the checkin payload shape.
+
+static void buildCheckinJson(String& out, OutboundEventType type, const char* userId,
+                              int slotNumber, bool offlineBuffered) {
+  StaticJsonDocument<256> doc;
+  doc["deviceId"] = deviceId;
+  doc["timestamp"] = getISOTimestamp();
+  doc["offlineBuffered"] = offlineBuffered;
+
+  if (type == EVT_FINGERPRINT_CHECKIN) {
+    doc["slotNumber"] = slotNumber;
+    doc["authMode"] = "fingerprint";
+  } else {
+    doc["userId"] = userId;
+    doc["authMode"] = "pin";
+  }
+  serializeJson(doc, out);
+}
+
+// ---------- offline buffer (LittleFS, JSON-only, photos excluded) ----------
+
+// Normalizes a File::name() result to a full "/buf/xxxxx.json" path,
+// regardless of whether this core version's name() already includes
+// the directory prefix or not -- that behavior has changed across
+// arduino-esp32 core versions, so don't assume either way.
+static String normalizeBufferPath(const char* rawName) {
+  String name = String(rawName);
+  if (!name.startsWith("/")) {
+    name = String(BUFFER_DIR) + "/" + name;
+  }
+  return name;
+}
+
+static void initOfflineBuffer() {
+  if (!LittleFS.begin(true)) return;
+  LittleFS.mkdir(BUFFER_DIR);
+
+  File dir = LittleFS.open(BUFFER_DIR);
+  File f = dir.openNextFile();
+  while (f) {
+    String path = normalizeBufferPath(f.name());
+    int slash = path.lastIndexOf('/');
+    String basename = path.substring(slash + 1); // "00001.json"
+    uint32_t seq = (uint32_t)basename.toInt();     // toInt() stops at the first non-digit, e.g. '.'
+    if (seq >= nextBufferSeq) nextBufferSeq = seq + 1;
+    f = dir.openNextFile();
+  }
+  dir.close();
+}
+
+static void persistJsonToBuffer(const String& url, const String& json) {
+  // Sized to comfortably hold the longest URL + body we send (command
+  // result / checkin bodies run up to ~256 bytes) plus ArduinoJson's
+  // own overhead -- the old 64-byte version couldn't fit either field.
+  StaticJsonDocument<512> wrapper;
+  wrapper["url"] = url;
+  wrapper["body"] = json;
+  String wrapped;
+  serializeJson(wrapper, wrapped);
+
+  char path[48];
+  snprintf(path, sizeof(path), "%s/%05lu.json", BUFFER_DIR, (unsigned long)nextBufferSeq++);
+  File f = LittleFS.open(path, "w");
+  if (f) { f.print(wrapped); f.close(); }
+}
+
+static bool drainOneBufferedEvent() {
+  File dir = LittleFS.open(BUFFER_DIR);
+  File f = dir.openNextFile();
+  String oldestPath = "";
+  while (f) {
+    String path = normalizeBufferPath(f.name());
+    if (oldestPath == "" || path < oldestPath) oldestPath = path;
+    f = dir.openNextFile();
+  }
+  dir.close();
+  if (oldestPath == "") return true;
+
+  File ev = LittleFS.open(oldestPath, "r");
+  if (!ev) return true;
+  String wrapped = ev.readString();
+  ev.close();
+
+  StaticJsonDocument<512> wrapper;
+  if (deserializeJson(wrapper, wrapped) != DeserializationError::Ok) {
+    LittleFS.remove(oldestPath);
+    return false;
+  }
+
+  String url = wrapper["url"];
+  String body = wrapper["body"];
+  if (httpPostJson(url.c_str(), body)) {
+    LittleFS.remove(oldestPath);
+    return false;
+  }
+  return true;
+}
+
+// ---------- evidence photo upload ----------
+
+static bool sendEvidencePhoto(const String& userId, const String& attendanceId,
+                               uint8_t* imageBuf, size_t imageLen) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8000);
   if (!client.connect(host, 443)) return false;
 
   String boundary = "AttendXBoundary123";
   String head = "--" + boundary + "\r\n"
-              + "Content-Disposition: form-data; name=\"userId\"\r\n\r\n"
-              + manualID + "\r\n"
+              + "Content-Disposition: form-data; name=\"userId\"\r\n\r\n" + userId + "\r\n"
+              + "--" + boundary + "\r\n"
+              + "Content-Disposition: form-data; name=\"attendanceId\"\r\n\r\n" + attendanceId + "\r\n"
+              + "--" + boundary + "\r\n"
+              + "Content-Disposition: form-data; name=\"deviceId\"\r\n\r\n" + String(deviceId) + "\r\n"
               + "--" + boundary + "\r\n"
               + "Content-Disposition: form-data; name=\"image\"; filename=\"audit.jpg\"\r\n"
               + "Content-Type: image/jpeg\r\n\r\n";
   String tail = "\r\n--" + boundary + "--\r\n";
-
   uint32_t totalLen = head.length() + imageLen + tail.length();
 
   client.println("POST /api/attendance/evidence HTTP/1.1");
@@ -122,25 +223,233 @@ bool sendManualLogWithPhoto(String manualID, uint8_t* imageBuf, size_t imageLen)
   client.println();
   client.print(head);
 
-  // Safely stream the JPEG directly from the PSRAM buffer
-  uint8_t *fbBuf = imageBuf;
-  size_t fbLen = imageLen;
-  for (size_t n = 0; n < fbLen; n += 1024) {
-    if (n + 1024 < fbLen) {
-      client.write(fbBuf, 1024);
-      fbBuf += 1024;
-    } else {
-      client.write(fbBuf, fbLen % 1024);
-    }
+  uint8_t* p = imageBuf;
+  size_t remaining = imageLen;
+  while (remaining > 0) {
+    size_t chunk = remaining < 1024 ? remaining : 1024;
+    client.write(p, chunk);
+    p += chunk;
+    remaining -= chunk;
   }
-  
   client.print(tail);
-  
-  // Read response header to ensure completion
+
+  String statusLine = client.readStringUntil('\n');
+  bool ok = statusLine.indexOf(" 200 ") > 0 || statusLine.indexOf(" 201 ") > 0;
+
   while (client.connected()) {
     String line = client.readStringUntil('\n');
-    if (line == "\r") break; 
+    if (line == "\r") break;
   }
   client.stop();
-  return true;
+  return ok;
+}
+
+// ---------- outbound event handling ----------
+
+static void handleOutboundEvent(OutboundEvent& evt) {
+  bool sent = false;
+  String url, body, respBody;
+
+  if (evt.type == EVT_FINGERPRINT_CHECKIN || evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO) {
+    buildCheckinJson(body, evt.type, evt.userId, evt.slotNumber, evt.offlineBuffered);
+    url = "https://atendx.ai.studio/api/attendance/checkin";
+    sent = httpPostJson(url.c_str(), body, &respBody);
+
+    if (sent && evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO && evt.photoBuf) {
+      StaticJsonDocument<256> respDoc;
+      deserializeJson(respDoc, respBody);
+      String attendanceId = respDoc["attendanceId"] | "";
+      if (!sendEvidencePhoto(evt.userId, attendanceId, evt.photoBuf, evt.photoLen)) {
+        Serial.println("Evidence photo failed to upload -- not retried/buffered (see design note)");
+      }
+    }
+  } else if (evt.type == EVT_COMMAND_RESULT) {
+    StaticJsonDocument<256> doc;
+    doc["deviceId"] = deviceId;
+    if (strlen(evt.commandId) > 0) doc["commandId"] = evt.commandId;
+    doc["type"] = evt.commandType;
+    doc["status"] = evt.status;
+    doc["source"] = evt.source;
+    if (strlen(evt.errorReason) > 0) doc["errorReason"] = evt.errorReason;
+    if (evt.slotNumber > 0) doc["slotNumber"] = evt.slotNumber;
+    if (strlen(evt.userId) > 0) doc["userId"] = evt.userId;
+    doc["timestamp"] = getISOTimestamp();
+
+    url = "https://atendx.ai.studio/api/devices/commands/result";
+    serializeJson(doc, body);
+    sent = httpPostJson(url.c_str(), body, &respBody);
+    // Note: local dedup no longer waits on this succeeding -- see
+    // clearInProgressCommand(), called from AttendX.ino right after
+    // a dashboard command finishes executing.
+  }
+
+  if (!sent) {
+    persistJsonToBuffer(url, body);
+  }
+
+  if (evt.photoBuf) free(evt.photoBuf);
+}
+
+// ---------- telemetry + command retrieval ----------
+
+static void doTelemetryTick(const char* lcdLine1, const char* lcdLine2) {
+  StaticJsonDocument<256> reqDoc;
+  reqDoc["deviceId"] = deviceId;
+  reqDoc["wifiStatus"] = "Connected";
+  reqDoc["rssi"] = WiFi.RSSI();
+  reqDoc["ipAddress"] = WiFi.localIP().toString();
+  reqDoc["powerStatus"] = "DC";
+  reqDoc["batteryStatus"] = 100;
+  reqDoc["esp32Heap"] = String(ESP.getFreeHeap() / 1024) + " KB Free";
+  JsonArray lcd = reqDoc.createNestedArray("lcdText");
+  lcd.add(lcdLine1);
+  lcd.add(lcdLine2);
+
+  String body;
+  serializeJson(reqDoc, body);
+
+  String respBody;
+  if (!httpPostJson("https://atendx.ai.studio/api/devices/telemetry", body, &respBody)) return;
+
+  StaticJsonDocument<512> respDoc;
+  if (deserializeJson(respDoc, respBody) != DeserializationError::Ok) return;
+
+  if (strlen(inProgressCommandId) > 0) return; // already executing one locally
+
+  JsonArray commands = respDoc["commands"].as<JsonArray>();
+  for (JsonObject cmd : commands) {
+    const char* cmdId = cmd["commandId"] | "";
+    const char* type = cmd["type"] | "";
+
+    IncomingCommand ic = {};
+    strncpy(ic.commandId, cmdId, COMMANDID_MAX_LEN - 1);
+
+    if (strcmp(type, "ENROLL_FINGERPRINT") == 0) {
+      ic.type = CMD_ENROLL_FINGERPRINT;
+      strncpy(ic.userId, cmd["userId"] | "", USERID_MAX_LEN - 1);
+    } else if (strcmp(type, "DELETE_FINGERPRINT") == 0) {
+      ic.type = CMD_DELETE_FINGERPRINT;
+      ic.slotNumber = cmd["slotNumber"] | 0;
+    } else {
+      continue;
+    }
+
+    if (xQueueSend(inboundCommandQueue, &ic, 0) == pdTRUE) {
+      strncpy(inProgressCommandId, cmdId, COMMANDID_MAX_LEN - 1);
+      break;
+    }
+  }
+}
+
+// ---------- the network task itself ----------
+
+static void networkTaskFn(void* param) {
+  initOfflineBuffer();
+
+  unsigned long lastReconnectAttempt = 0;
+  unsigned long lastTelemetry = 0;
+  unsigned long lastBufferDrain = 0;
+
+  while (WiFi.status() != WL_CONNECTED) vTaskDelay(pdMS_TO_TICKS(200));
+  setupTime();
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (millis() - lastReconnectAttempt > 5000) {
+        WiFi.reconnect();
+        lastReconnectAttempt = millis();
+      }
+    }
+
+    OutboundEvent evt;
+    if (xQueueReceive(outboundQueue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+      handleOutboundEvent(evt);
+    }
+
+    if (millis() - lastTelemetry > 30000) {
+      char l1[17], l2[17];
+      getLcdTextSnapshot(l1, l2);
+      doTelemetryTick(l1, l2);
+      lastTelemetry = millis();
+    }
+
+    if (WiFi.status() == WL_CONNECTED && millis() - lastBufferDrain > 5000) {
+      drainOneBufferedEvent();
+      lastBufferDrain = millis();
+    }
+  }
+}
+
+// ---------- public API (called from the UI task) ----------
+
+void initApiClient() {
+  outboundQueue = xQueueCreate(10, sizeof(OutboundEvent));
+  inboundCommandQueue = xQueueCreate(3, sizeof(IncomingCommand));
+
+  xTaskCreatePinnedToCore(
+    networkTaskFn,
+    "NetworkTask",
+    8192,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+}
+
+void queueFingerprintCheckin(int slotNumber) {
+  OutboundEvent evt = {};
+  evt.type = EVT_FINGERPRINT_CHECKIN;
+  evt.slotNumber = slotNumber;
+  if (xQueueSend(outboundQueue, &evt, 0) != pdTRUE) {
+    String body;
+    buildCheckinJson(body, EVT_FINGERPRINT_CHECKIN, "", slotNumber, true);
+    persistJsonToBuffer("https://atendx.ai.studio/api/attendance/checkin", body);
+  }
+}
+
+void queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t photoLen) {
+  OutboundEvent evt = {};
+  evt.type = EVT_MANUAL_CHECKIN_WITH_PHOTO;
+  strncpy(evt.userId, userId.c_str(), USERID_MAX_LEN - 1);
+  evt.photoBuf = photoBuf;
+  evt.photoLen = photoLen;
+  if (xQueueSend(outboundQueue, &evt, 0) != pdTRUE) {
+    // Queue full: still buffer the check-in itself, even though the
+    // photo can't be retried offline -- losing the whole event here
+    // would be worse than just losing the photo.
+    String body;
+    buildCheckinJson(body, EVT_MANUAL_CHECKIN_WITH_PHOTO, userId.c_str(), 0, true);
+    persistJsonToBuffer("https://atendx.ai.studio/api/attendance/checkin", body);
+    free(photoBuf);
+  }
+}
+
+void queueCommandResult(const IncomingCommand& cmd, bool success, const char* errorReason, int assignedSlot) {
+  OutboundEvent evt = {};
+  evt.type = EVT_COMMAND_RESULT;
+  strncpy(evt.commandId, cmd.commandId, COMMANDID_MAX_LEN - 1);
+  strncpy(evt.commandType, cmd.type == CMD_ENROLL_FINGERPRINT ? "ENROLL_FINGERPRINT" : "DELETE_FINGERPRINT", STRFIELD_MAX_LEN - 1);
+  strncpy(evt.status, success ? "success" : "error", 15);
+  strncpy(evt.source, "dashboard", 15);
+  if (errorReason) strncpy(evt.errorReason, errorReason, STRFIELD_MAX_LEN - 1);
+  evt.slotNumber = assignedSlot;
+  strncpy(evt.userId, cmd.userId, USERID_MAX_LEN - 1);
+  xQueueSend(outboundQueue, &evt, 0);
+}
+
+void queueTerminalInitiatedResult(const char* type, const String& userId, int slotNumber, bool success, const char* errorReason) {
+  OutboundEvent evt = {};
+  evt.type = EVT_COMMAND_RESULT;
+  strncpy(evt.commandType, type, STRFIELD_MAX_LEN - 1);
+  strncpy(evt.status, success ? "success" : "error", 15);
+  strncpy(evt.source, "terminal", 15);
+  if (errorReason) strncpy(evt.errorReason, errorReason, STRFIELD_MAX_LEN - 1);
+  evt.slotNumber = slotNumber;
+  strncpy(evt.userId, userId.c_str(), USERID_MAX_LEN - 1);
+  xQueueSend(outboundQueue, &evt, 0);
+}
+
+bool pollIncomingCommand(IncomingCommand& out) {
+  return xQueueReceive(inboundCommandQueue, &out, 0) == pdTRUE;
 }
