@@ -254,6 +254,7 @@ static void handleOutboundEvent(OutboundEvent& evt) {
     buildCheckinJson(body, evt.type, evt.userId, evt.slotNumber, evt.offlineBuffered);
     url = "https://atendx.ai.studio/api/attendance/checkin";
     sent = httpPostJson(url.c_str(), body, &respBody);
+    
 
     if (sent && evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO && evt.photoBuf) {
       StaticJsonDocument<256> respDoc;
@@ -278,6 +279,7 @@ static void handleOutboundEvent(OutboundEvent& evt) {
     url = "https://atendx.ai.studio/api/devices/commands/result";
     serializeJson(doc, body);
     sent = httpPostJson(url.c_str(), body, &respBody);
+    Serial.printf("POST %s -> %s\n", url.c_str(), sent ? "OK" : "FAILED (buffering for retry)");
     // Note: local dedup no longer waits on this succeeding -- see
     // clearInProgressCommand(), called from AttendX.ino right after
     // a dashboard command finishes executing.

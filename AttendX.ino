@@ -48,8 +48,13 @@ static bool initCamera() {
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
-
-  return esp_camera_init(&config) == ESP_OK;
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init FAILED, error 0x%x\n", err);
+    return false;
+  }
+  Serial.println("Camera init OK");
+  return true;
 }
 
 // Captures one JPEG into a heap buffer the caller owns (must free() it,
@@ -57,14 +62,26 @@ static bool initCamera() {
 // Returns nullptr on failure.
 static uint8_t* capturePhoto(size_t* outLen) {
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) return nullptr;
+  if (!fb) {
+    Serial.println("Camera capture FAILED: esp_camera_fb_get() returned null");
+    return nullptr;
+  }
+
+  Serial.printf("Captured frame: %u bytes, %ux%u\n", fb->len, fb->width, fb->height);
+  if (fb->len > 2 && fb->buf[0] == 0xFF && fb->buf[1] == 0xD8) {
+    Serial.println("  -> looks like a valid JPEG (FF D8 header present)");
+  } else {
+    Serial.println("  -> WARNING: does not look like a valid JPEG");
+  }
 
   uint8_t* copy = (uint8_t*)malloc(fb->len);
   if (copy) {
     memcpy(copy, fb->buf, fb->len);
     *outLen = fb->len;
+  } else {
+    Serial.println("  -> malloc FAILED, out of heap");
   }
-  esp_camera_fb_return(fb); // must return the driver's buffer, never free() it directly
+  esp_camera_fb_return(fb);
   return copy;
 }
 
