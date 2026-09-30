@@ -5,18 +5,67 @@
 #include "api_client.h"
 #include "secrets.h"
 #include "esp_camera.h"
+#include <time.h>
 
 static bool fingerprintOK = false;
+static bool cameraOK = false;
 
 // --- wraps updateDisplay so the network task always knows what's on screen ---
-static void display(const char* l1, const char* l2) {
-  updateDisplay(l1, l2);
+// Only reports the top two lines to telemetry -- that's the contract the
+// backend already expects; rows 3/4 (idle clock) are purely local.
+static void display(const char* l1, const char* l2, const char* l3 = "", const char* l4 = "") {
+  updateDisplay(l1, l2, l3, l4);
   reportLcdText(l1, l2);
 }
 
-// ---------------- camera ----------------
+// ---------------- idle screen (v3: shows date/time now that the LCD is 20x4) ----------------
 
-static bool cameraOK = false;
+static void formatIdleClock(char* dateBuf, size_t dateLen, char* timeBuf, size_t timeLen) {
+  if (!isTimeSynced()) {
+    snprintf(dateBuf, dateLen, "%s", "");
+    snprintf(timeBuf, timeLen, "%s", "--:--");
+    return;
+  }
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  strftime(dateBuf, dateLen, "%a %b %d", &timeinfo);   // e.g. "Mon Sep 29"
+  strftime(timeBuf, timeLen, "%I:%M %p", &timeinfo);   // 12-hour, e.g. "02:47 PM"
+}
+
+// True while the idle screen is the thing currently on the LCD --
+// tracks whether the NEXT call needs a full redraw (just arrived at
+// idle, title/status text needs (re)writing) or just a clock tick
+// (already idle, only the time changed).
+static bool onIdleScreen = false;
+static char lastShownTime[9] = "";
+
+static void showIdleScreen(bool forceFullRedraw = false) {
+  char dateBuf[21], timeBuf[21];
+  formatIdleClock(dateBuf, sizeof(dateBuf), timeBuf, sizeof(timeBuf));
+
+  if (forceFullRedraw || !onIdleScreen) {
+    // Entering idle, or first draw -- this is the only case that
+    // touches lcd.clear() (via display()/updateDisplay()).
+    display("AttendX Ready", "Scan or Press #", dateBuf, timeBuf);
+    onIdleScreen = true;
+  } else if (strcmp(timeBuf, lastShownTime) != 0) {
+    // Already showing idle, just the clock advanced -- rewrite only
+    // that row, no clear(), so there's nothing to flicker.
+    updateDisplayRow(3, timeBuf);
+  }
+  strncpy(lastShownTime, timeBuf, sizeof(lastShownTime) - 1);
+}
+
+// Call this from anywhere that's about to put something else on the
+// LCD (admin menu, a scan result, etc.) so the next return to idle
+// does a full redraw instead of assuming the title/status is still there.
+static void leavingIdleScreen() {
+  onIdleScreen = false;
+}
+
+// ---------------- camera ----------------
 
 static bool initCamera() {
   camera_config_t config = {};
@@ -48,13 +97,8 @@ static bool initCamera() {
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init FAILED, error 0x%x\n", err);
-    return false;
-  }
-  Serial.println("Camera init OK");
-  return true;
+
+  return esp_camera_init(&config) == ESP_OK;
 }
 
 // Captures one JPEG into a heap buffer the caller owns (must free() it,
@@ -62,47 +106,72 @@ static bool initCamera() {
 // Returns nullptr on failure.
 static uint8_t* capturePhoto(size_t* outLen) {
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture FAILED: esp_camera_fb_get() returned null");
-    return nullptr;
-  }
-
-  Serial.printf("Captured frame: %u bytes, %ux%u\n", fb->len, fb->width, fb->height);
-  if (fb->len > 2 && fb->buf[0] == 0xFF && fb->buf[1] == 0xD8) {
-    Serial.println("  -> looks like a valid JPEG (FF D8 header present)");
-  } else {
-    Serial.println("  -> WARNING: does not look like a valid JPEG");
-  }
+  if (!fb) return nullptr;
 
   uint8_t* copy = (uint8_t*)malloc(fb->len);
   if (copy) {
     memcpy(copy, fb->buf, fb->len);
     *outLen = fb->len;
-  } else {
-    Serial.println("  -> malloc FAILED, out of heap");
   }
-  esp_camera_fb_return(fb);
+  esp_camera_fb_return(fb); // must return the driver's buffer, never free() it directly
   return copy;
 }
 
 // Note: PWDN_GPIO_NUM is -1 in pins.h (not wired), so real hardware
-// power-down isn't possible on this board -- that's why there's no
-// sleepCamera()/wakeCamera() here. Given the terminal also reports
-// powerStatus: "AC" (mains-powered, not battery), the power saving
-// wasn't buying anything real; dropping it is the honest fix rather
-// than keeping dead functions around.
+// power-down isn't possible on this board -- device is mains-powered
+// anyway (powerStatus: "AC" in telemetry), so no sleepCamera()/wakeCamera().
 
 // ---------------- fingerprint init warning ----------------
 
 static void onFingerprintRetry(int attempt, int max) {
-  char line2[17];
+  char line2[21];
   snprintf(line2, sizeof(line2), "Retry %d/%d", attempt, max);
   display("Sensor Error", line2);
+}
+
+// ---------------- pre-enroll user verification (v3, item 3) ----------------
+// Shared by both the terminal-initiated (admin menu) and dashboard-initiated
+// (handlePendingCommand) enroll paths, so there's exactly one place that
+// decides whether it's safe to start a fingerprint capture.
+// PreEnrollCheck itself is declared in api_client.h, not here -- see the
+// comment there for why (Arduino auto-prototype ordering).
+
+static PreEnrollCheck checkUserBeforeEnroll(const String& userId) {
+  display("Checking ID...", userId.c_str());
+
+  UserStatusResult result;
+  bool gotAnswer = queryUserStatus(userId, result, 5000);
+
+  // Both "no answer in time" and "answer arrived but says it couldn't
+  // verify" mean the same thing here: never guess, refuse to enroll.
+  if (!gotAnswer || !result.requestSucceeded) return PRECHECK_VERIFY_FAILED;
+  if (!result.exists) return PRECHECK_NOT_FOUND;
+  if (result.hasFingerprint) return PRECHECK_ALREADY_ENROLLED;
+  return PRECHECK_OK;
+}
+
+// Turns a failed precheck into the matching LCD message + errorReason
+// string, so both call sites report identically.
+static const char* precheckFailureLine1(PreEnrollCheck check) {
+  switch (check) {
+    case PRECHECK_NOT_FOUND:        return "User Not Found";
+    case PRECHECK_ALREADY_ENROLLED: return "Already Enrolled";
+    default:                        return "Cannot Verify";
+  }
+}
+
+static const char* precheckFailureReason(PreEnrollCheck check) {
+  switch (check) {
+    case PRECHECK_NOT_FOUND:        return "user_not_found";
+    case PRECHECK_ALREADY_ENROLLED: return "already_enrolled";
+    default:                        return "verify_failed";
+  }
 }
 
 // ---------------- admin menu ----------------
 
 static void runAdminMenu() {
+  leavingIdleScreen();
   String pin = getMaskedPIN("Admin PIN:");
   if (pin != ADMIN_PIN) {
     display("Wrong PIN", "");
@@ -125,18 +194,30 @@ static void runAdminMenu() {
       delay(1500);
       return;
     }
-    int slot = findNextFreeSlot();
-    if (slot == 0) {
-      display("Enroll Failed", "Sensor Full");
-      delay(1500);
-      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", "", 0, false, "slot_full");
-      return;
-    }
 
+    display("Enter User ID:", "e.g. 123A");
     String userId = getManualID();
     if (userId.length() == 0) {
       display("Cancelled", "");
       delay(1000);
+      return;
+    }
+
+    // v3 item 3: verify the ID is real and unenrolled BEFORE the human
+    // places a finger at all -- never scan against an unverified ID.
+    PreEnrollCheck check = checkUserBeforeEnroll(userId);
+    if (check != PRECHECK_OK) {
+      display(precheckFailureLine1(check), "");
+      delay(1500);
+      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, 0, false, precheckFailureReason(check));
+      return;
+    }
+
+    int slot = findNextFreeSlot();
+    if (slot == 0) {
+      display("Enroll Failed", "Sensor Full");
+      delay(1500);
+      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, 0, false, "slot_full");
       return;
     }
 
@@ -178,15 +259,32 @@ static void runAdminMenu() {
 static void handlePendingCommand() {
   IncomingCommand cmd;
   if (!pollIncomingCommand(cmd)) return;
+  leavingIdleScreen();
 
   if (cmd.type == CMD_ENROLL_FINGERPRINT) {
     if (!isFingerprintAvailable()) {
       queueCommandResult(cmd, false, "sensor_offline", 0);
+      clearInProgressCommand();
       return;
     }
+
+    // Same v3 pre-check as the terminal-initiated path -- if the
+    // dashboard queued a command for a userId that's since been
+    // deleted, already enrolled, or never existed, catch it before
+    // making someone place their finger for nothing.
+    String userId = String(cmd.userId);
+    PreEnrollCheck check = checkUserBeforeEnroll(userId);
+    if (check != PRECHECK_OK) {
+      queueCommandResult(cmd, false, precheckFailureReason(check), 0);
+      showIdleScreen();
+      clearInProgressCommand();
+      return;
+    }
+
     int slot = findNextFreeSlot();
     if (slot == 0) {
       queueCommandResult(cmd, false, "slot_full", 0);
+      clearInProgressCommand();
       return;
     }
     EnrollResult result = enrollFingerprint(slot, [](const char* l1, const char* l2) {
@@ -197,7 +295,7 @@ static void handlePendingCommand() {
     } else {
       queueCommandResult(cmd, false, enrollResultToString(result), 0);
     }
-    display("Ready", "Scan Finger");
+    showIdleScreen();
 
   } else if (cmd.type == CMD_DELETE_FINGERPRINT) {
     bool ok = deleteFingerprint(cmd.slotNumber);
@@ -223,20 +321,24 @@ void setup() {
   fingerprintOK = initFingerprint(onFingerprintRetry);
   cameraOK = initCamera();
 
-  initApiClient(); // starts the network task on core 0
+  initApiClient(); // starts the network task on core 0 -- this is also
+                    // what kicks off the bounded NTP sync (setupTime())
+                    // for the idle-screen clock
 
   if (!fingerprintOK) {
     display("Keypad Mode", "Press # for ID");
     delay(2000);
   }
-  display("Ready", "Scan Finger");
+  showIdleScreen();
 }
 
 void loop() {
-  char key = getKeypress();
+  char key = getKeypress(); // read once per iteration, use everywhere below
+  bool handledSomething = false;
+
   if (key == 'A') {
     runAdminMenu();
-    display("Ready", "Scan Finger");
+    handledSomething = true;
   }
 
   handlePendingCommand();
@@ -244,20 +346,39 @@ void loop() {
   if (fingerprintOK) {
     int slot = checkFingerprint();
     if (slot > 0) {
-      display("Welcome", ("Employee " + String(slot)).c_str());
+      leavingIdleScreen();
+      display("Welcome", ("Slot " + String(slot)).c_str());
       queueFingerprintCheckin(slot);
       delay(2000);
-      display("Ready", "Scan Finger");
+      handledSomething = true;
     } else if (slot == -1) {
+      leavingIdleScreen();
+      display("Read Failed", "Try Again");
       Serial.println("Fingerprint sensor read error");
+      delay(1000);
+      handledSomething = true;
+    } else if (slot == -2) {
+      // A finger WAS placed and read cleanly, just matched nothing --
+      // distinct from slot == 0 (no finger present at all, the normal
+      // idle state), which deliberately does nothing here.
+      leavingIdleScreen();
+      display("Finger Not", "Registered");
+      delay(1500);
+      handledSomething = true;
     }
+    // slot == 0: no finger present, nothing to do -- falls through to
+    // the idle-screen refresh below.
   }
 
   if (key == '#') {
+    leavingIdleScreen();
     String userId = getManualID();
     if (userId.length() > 0) {
       if (cameraOK) {
         display("Hold Still", "Taking Photo");
+        delay(500); // gives the LCD message time to actually be visible
+                    // before the near-instant capture below -- otherwise
+                    // this flashes by unseen
         size_t photoLen;
         uint8_t* photo = capturePhoto(&photoLen);
         if (photo) {
@@ -271,7 +392,18 @@ void loop() {
       }
       delay(2000);
     }
-    display("Ready", "Scan Finger");
+    handledSomething = true;
+  }
+
+  // Idle-screen refresh: only when nothing else happened this
+  // iteration, and only every 1s -- keeps the clock ticking without
+  // hammering the I2C bus on every single loop() pass.
+  static unsigned long lastIdleRefresh = 0;
+  if (!handledSomething && millis() - lastIdleRefresh > 1000) {
+    showIdleScreen();
+    lastIdleRefresh = millis();
+  } else if (handledSomething) {
+    lastIdleRefresh = 0; // force an immediate refresh next idle iteration
   }
 
   delay(10);

@@ -1,13 +1,13 @@
-// fingerprint.cpp
 #include <cstdint>
 #include "pins.h"
 #include "fingerprint.h"
 #include <Adafruit_Fingerprint.h>
 
-// Sensor is a DY50 module, default baud
+// Sensor is a DY50 module, AS608-protocol-compatible -- default baud
 // 57600. Valid IDs are 0-126 (127 slots total), but slot 0 is
 // reserved as our internal "no match" sentinel and is never assigned
-// during enrollment
+// during enrollment -- this also matches the backend's own validation
+// (slotNumber >= 1 on all operations).
 HardwareSerial fingerSerial(1);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
 
@@ -15,9 +15,9 @@ static bool sensorAvailable = false;
 static const int MAX_INIT_ATTEMPTS = 3;
 static const unsigned long RETRY_DELAY_MS = 3000;
 
-static const int MAX_SLOTS = 126;
+static const int MAX_SLOTS = 126; // usable range is 1-126; slot 0 reserved
 
-static const unsigned long ENROLL_STEP_TIMEOUT_MS = 10000; //Per finger placement
+static const unsigned long ENROLL_STEP_TIMEOUT_MS = 10000; // per finger placement
 
 bool initFingerprint(WarningCallback onRetryWarning) {
   fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
@@ -56,7 +56,8 @@ int checkFingerprint() {
   p = finger.fingerSearch();
   if (p == FINGERPRINT_OK) return finger.fingerID;
 
-  return 0; // read cleanly, just no match
+  return -2; // read cleanly, but no match -- see fingerprint.h for why
+             // this is distinct from the "no finger present" 0 case
 }
 
 const char* enrollResultToString(EnrollResult result) {
@@ -73,7 +74,7 @@ const char* enrollResultToString(EnrollResult result) {
 }
 
 int findNextFreeSlot() {
-  // Ask the sensor itself rather than tracking a local slot bitmap —
+  // Ask the sensor itself rather than tracking a local slot bitmap --
   // this keeps the sensor as the single source of truth, so there's
   // no way for our bookkeeping and the sensor's actual contents to
   // drift out of sync (e.g. after a reflash or a manual sensor reset).
@@ -132,7 +133,7 @@ EnrollResult enrollFingerprint(int slot, EnrollPromptCallback onPrompt) {
 
   if (finger.createModel() != FINGERPRINT_OK) return ENROLL_MISMATCH;
 
-  // Duplicate check — search the existing database with this freshly
+  // Duplicate check -- search the existing database with this freshly
   // created model before writing it anywhere.
   if (finger.fingerFastSearch() == FINGERPRINT_OK) {
     return ENROLL_DUPLICATE;

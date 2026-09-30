@@ -1,4 +1,3 @@
-// api_client.h
 #ifndef API_CLIENT_H
 #define API_CLIENT_H
 
@@ -38,18 +37,54 @@ struct IncomingCommand {
   int slotNumber;
 };
 
+// ---------- user status pre-check (v3) ----------
+//
+// Separate from OutboundEvent/outboundQueue on purpose: everything else on
+// that queue is fire-and-forget (UI task posts, moves on). This one is a
+// blocking request/response -- the UI task needs the answer before deciding
+// whether to prompt "Place Finger" at all, so enrollment never proceeds
+// against an unverified userId. Only the network task is allowed to touch
+// WiFi/HTTPS, so this still has to be a hand-off, just a synchronous one.
+
+struct UserStatusRequest {
+  char userId[USERID_MAX_LEN];
+};
+
+struct UserStatusResult {
+  bool requestSucceeded;   // false = couldn't reach the backend at all
+                            // (WiFi down, timeout, bad response). Caller
+                            // must refuse to enroll in this case -- never
+                            // guess when verification itself failed.
+  bool exists;
+  bool hasFingerprint;
+};
+enum PreEnrollCheck { PRECHECK_OK, PRECHECK_NOT_FOUND, PRECHECK_ALREADY_ENROLLED, PRECHECK_VERIFY_FAILED };
 // Starts the network task (core 0) and creates the queues. Call once from setup().
 void initApiClient();
-void reportLcdText(const char* line1, const char* line2);
-void clearInProgressCommand(); // call once a dashboard-pushed command has been locally executed (success or failure), regardless of whether reporting it back over the network succeeded
+
 // --- Called from the UI task (core 1) only ---
 void queueFingerprintCheckin(int slotNumber);
 void queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t photoLen);
 void queueCommandResult(const IncomingCommand& cmd, bool success, const char* errorReason, int assignedSlot);
 void queueTerminalInitiatedResult(const char* type, const String& userId, int slotNumber, bool success, const char* errorReason);
-void reportLcdText(const char* line1, const char* line2); // call from UI task after every updateDisplay
+
+// Blocking. Sends the request to the network task and waits up to timeoutMs
+// for the answer. Returns false only if no answer arrived within timeoutMs
+// (queue full, or the network task never replied) -- in that case treat it
+// the same as requestSucceeded == false in outResult: refuse to enroll.
+bool queryUserStatus(const String& userId, UserStatusResult& outResult, unsigned long timeoutMs = 5000);
 
 // Non-blocking. Returns true and fills `out` if a command is waiting.
 bool pollIncomingCommand(IncomingCommand& out);
+
+void clearInProgressCommand(); // call once a dashboard-pushed command has been locally executed (success or failure), regardless of whether reporting it back over the network succeeded
+
+// Call from the UI task after every updateDisplay(), so telemetry always
+// reports what's actually on screen.
+void reportLcdText(const char* line1, const char* line2);
+
+// True once NTP has completed at least one successful sync. The idle
+// screen should show a placeholder ("--:--") until this is true.
+bool isTimeSynced();
 
 #endif

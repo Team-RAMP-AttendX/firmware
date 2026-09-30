@@ -1,4 +1,3 @@
-// fingerprint.h
 #ifndef FINGERPRINT_H
 #define FINGERPRINT_H
 
@@ -17,9 +16,14 @@ bool initFingerprint(WarningCallback onRetryWarning);
 bool isFingerprintAvailable();
 
 // Non-blocking poll.
-//  > 0  → matched slot ID
-//    0  → no finger present, or finger read but no match
-//   -1  → sensor communication error (distinct from "no match", for logging)
+//  > 0  -> matched slot ID
+//    0  -> no finger present -- the normal idle state, checked every
+//          loop iteration. Not an event, nothing to show on the LCD.
+//   -1  -> sensor communication/read error -- "Read failed, retry"
+//   -2  -> a finger WAS placed and read cleanly, but matched nothing --
+//          "Finger not registered". Distinct from 0 on purpose: this
+//          only fires on an actual placed-and-rejected finger, not on
+//          every idle poll where no finger is there at all.
 int checkFingerprint();
 
 enum EnrollResult {
@@ -32,7 +36,7 @@ enum EnrollResult {
   ENROLL_NO_FREE_SLOT
 };
 
-// Human-readable code for telemetry/logging, e.g. "duplicate_finger" —
+// Human-readable code for telemetry/logging, e.g. "duplicate_finger" --
 // matches the errorReason values the backend expects.
 const char* enrollResultToString(EnrollResult result);
 
