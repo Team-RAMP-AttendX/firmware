@@ -277,7 +277,10 @@ static void handlePendingCommand() {
 
   if (cmd.type == CMD_ENROLL_FINGERPRINT) {
     if (!isFingerprintAvailable()) {
+      display("Enroll Failed", "Sensor Offline");
+      delay(1500);
       queueCommandResult(cmd, false, "sensor_offline", 0);
+      showIdleScreen();
       clearInProgressCommand();
       return;
     }
@@ -289,6 +292,8 @@ static void handlePendingCommand() {
     String userId = String(cmd.userId);
     PreEnrollCheck check = checkUserBeforeEnroll(userId);
     if (check != PRECHECK_OK) {
+      display(precheckFailureLine1(check), "");
+      delay(1500);
       queueCommandResult(cmd, false, precheckFailureReason(check), 0);
       showIdleScreen();
       clearInProgressCommand();
@@ -297,23 +302,37 @@ static void handlePendingCommand() {
 
     int slot = findNextFreeSlot();
     if (slot == 0) {
+      display("Enroll Failed", "Sensor Full");
+      delay(1500);
       queueCommandResult(cmd, false, "slot_full", 0);
+      showIdleScreen();
       clearInProgressCommand();
       return;
     }
     EnrollResult result = enrollFingerprint(slot, [](const char* l1, const char* l2) {
       display(l1, l2);
     });
+    // This confirmation was missing entirely before -- the function
+    // went straight from enrollFingerprint()'s last prompt callback to
+    // showIdleScreen() with nothing shown in between, so a successful
+    // dashboard-triggered enroll looked, from the terminal, exactly
+    // like nothing had happened at all.
     if (result == ENROLL_OK) {
+      display("Enrolled", ("Slot " + String(slot)).c_str());
       queueCommandResult(cmd, true, nullptr, slot);
     } else {
+      display("Enroll Failed", enrollResultToString(result));
       queueCommandResult(cmd, false, enrollResultToString(result), 0);
     }
+    delay(2000);
     showIdleScreen();
 
   } else if (cmd.type == CMD_DELETE_FINGERPRINT) {
     bool ok = deleteFingerprint(cmd.slotNumber);
+    display(ok ? "Deleted" : "Delete Failed", ("Slot " + String(cmd.slotNumber)).c_str());
     queueCommandResult(cmd, ok, ok ? nullptr : "slot_not_found", cmd.slotNumber);
+    delay(1500);
+    showIdleScreen();
   }
   clearInProgressCommand();
 }
