@@ -83,8 +83,17 @@ void clearInProgressCommand() {
 
 // ---------- bounded HTTP helpers ----------
 
-static bool httpPostJson(const char* url, const String& body, String* respOut = nullptr) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+// codeOut is optional and defaults to nullptr so existing call sites that
+// only care about success/fail don't need to change. Added alongside the
+// command-result logging below -- true/false alone doesn't distinguish a
+// 400 (bad request -- a firmware bug) from a 404 (route/host issue) from
+// a 500 (backend bug) from a transport failure (code stays 0), and those
+// each point somewhere different when diagnosing a silent failure.
+static bool httpPostJson(const char* url, const String& body, String* respOut = nullptr, int* codeOut = nullptr) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (codeOut) *codeOut = 0;
+    return false;
+  }
 
   WiFiClientSecure client;
   client.setInsecure();     // TODO: pin the real CA cert before this leaves the demo
@@ -93,12 +102,16 @@ static bool httpPostJson(const char* url, const String& body, String* respOut = 
   HTTPClient http;
   http.setConnectTimeout(5000);
   http.setTimeout(5000);
-  if (!http.begin(client, url)) return false;
+  if (!http.begin(client, url)) {
+    if (codeOut) *codeOut = 0;
+    return false;
+  }
   http.addHeader("Content-Type", "application/json");
 
   int code = http.POST(body);
   bool ok = (code >= 200 && code < 300);
   if (respOut) *respOut = http.getString(); // capture body even on non-2xx, e.g. {"exists":false}
+  if (codeOut) *codeOut = code;
   http.end();
   return ok;
 }
@@ -317,7 +330,10 @@ static void handleOutboundEvent(OutboundEvent& evt) {
   if (evt.type == EVT_FINGERPRINT_CHECKIN || evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO) {
     buildCheckinJson(body, evt.type, evt.userId, evt.slotNumber, evt.offlineBuffered);
     url = "https://attendx-ramp.vercel.app/api/attendance/checkin";
-    sent = httpPostJson(url.c_str(), body, &respBody);
+    int httpCode = -1;
+    sent = httpPostJson(url.c_str(), body, &respBody, &httpCode);
+    Serial.printf("[checkin] HTTP %d sent=%s body=%s resp=%s\n",
+                  httpCode, sent ? "true" : "false", body.c_str(), respBody.c_str());
 
     if (sent && evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO && evt.photoBuf) {
       StaticJsonDocument<256> respDoc;
@@ -341,7 +357,10 @@ static void handleOutboundEvent(OutboundEvent& evt) {
 
     url = "https://attendx-ramp.vercel.app/api/devices/commands/result";
     serializeJson(doc, body);
-    sent = httpPostJson(url.c_str(), body, &respBody);
+    int httpCode = -1;
+    sent = httpPostJson(url.c_str(), body, &respBody, &httpCode);
+    Serial.printf("[commands/result] HTTP %d sent=%s body=%s resp=%s\n",
+                  httpCode, sent ? "true" : "false", body.c_str(), respBody.c_str());
     // Note: local dedup no longer waits on this succeeding -- see
     // clearInProgressCommand(), called from AttendX.ino right after
     // a dashboard command finishes executing.

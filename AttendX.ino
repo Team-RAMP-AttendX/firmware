@@ -89,7 +89,13 @@ static bool initCamera() {
   if (psramFound()) {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
-    config.fb_count = 2;
+    // fb_count = 1, not 2 -- we take single, infrequent shots here, not
+    // continuous video. With 2 buffers the sensor's free-running capture
+    // can queue up a second frame before you ever call fb_get(), and
+    // your NEXT call gets handed that stale leftover instead of a fresh
+    // frame -- symptom: photo N looks like a slightly-shifted duplicate
+    // of photo N-1. fb_count = 1 removes the backlog entirely.
+    config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
     config.frame_size = FRAMESIZE_QVGA;
@@ -105,6 +111,14 @@ static bool initCamera() {
 // or hand it to queueManualCheckinWithPhoto, which frees it for you).
 // Returns nullptr on failure.
 static uint8_t* capturePhoto(size_t* outLen) {
+  // Discard one frame before the real capture -- even with fb_count == 1,
+  // a frame that was sitting mid-capture when the sensor was last idle
+  // can still come back slightly stale. This grab-and-return is cheap
+  // insurance, not a fix for the fb_count=2 bug above (that's fixed at
+  // the source) -- belt and suspenders for single-shot reliability.
+  camera_fb_t* warm = esp_camera_fb_get();
+  if (warm) esp_camera_fb_return(warm);
+
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return nullptr;
 
