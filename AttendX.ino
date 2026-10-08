@@ -227,21 +227,24 @@ static void runAdminMenu() {
       return;
     }
 
-    int slot = findNextFreeSlot();
-    if (slot == 0) {
+    if (isSensorFull()) {
       display("Enroll Failed", "Sensor Full");
       delay(1500);
       queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, 0, false, "slot_full");
       return;
     }
 
-    EnrollResult result = enrollFingerprint(slot, [](const char* l1, const char* l2) {
+    // SFM-V1.7: the module assigns the ID itself during enrollment --
+    // enrolledSlot is filled in by enrollFingerprint() on success, not
+    // chosen up front like it was with the AS608 sensor.
+    int enrolledSlot = 0;
+    EnrollResult result = enrollFingerprint(enrolledSlot, [](const char* l1, const char* l2) {
       display(l1, l2);
     });
 
     if (result == ENROLL_OK) {
-      display("Enrolled", ("Slot " + String(slot)).c_str());
-      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, slot, true, nullptr);
+      display("Enrolled", ("Slot " + String(enrolledSlot)).c_str());
+      queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, enrolledSlot, true, nullptr);
     } else {
       display("Enroll Failed", enrollResultToString(result));
       queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, 0, false, enrollResultToString(result));
@@ -252,7 +255,9 @@ static void runAdminMenu() {
     display("Enter Slot #:", "");
     String slotStr = getManualID();
     int slot = slotStr.toInt();
-    if (slot < 1 || slot > 126) {
+    // SFM user IDs are 1-10000 per the protocol doc (was 1-126 on the
+    // AS608 sensor).
+    if (slot < 1 || slot > 10000) {
       display("Invalid Slot", "");
       delay(1500);
       return;
@@ -300,8 +305,7 @@ static void handlePendingCommand() {
       return;
     }
 
-    int slot = findNextFreeSlot();
-    if (slot == 0) {
+    if (isSensorFull()) {
       display("Enroll Failed", "Sensor Full");
       delay(1500);
       queueCommandResult(cmd, false, "slot_full", 0);
@@ -309,7 +313,10 @@ static void handlePendingCommand() {
       clearInProgressCommand();
       return;
     }
-    EnrollResult result = enrollFingerprint(slot, [](const char* l1, const char* l2) {
+    // Same as the terminal-initiated path: the SFM module picks the
+    // ID, so it's only known once the third scan commits.
+    int enrolledSlot = 0;
+    EnrollResult result = enrollFingerprint(enrolledSlot, [](const char* l1, const char* l2) {
       display(l1, l2);
     });
     // This confirmation was missing entirely before -- the function
@@ -318,8 +325,8 @@ static void handlePendingCommand() {
     // dashboard-triggered enroll looked, from the terminal, exactly
     // like nothing had happened at all.
     if (result == ENROLL_OK) {
-      display("Enrolled", ("Slot " + String(slot)).c_str());
-      queueCommandResult(cmd, true, nullptr, slot);
+      display("Enrolled", ("Slot " + String(enrolledSlot)).c_str());
+      queueCommandResult(cmd, true, nullptr, enrolledSlot);
     } else {
       display("Enroll Failed", enrollResultToString(result));
       queueCommandResult(cmd, false, enrollResultToString(result), 0);

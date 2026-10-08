@@ -9,8 +9,29 @@
 #define LCD_SDA_PIN      38
 #define LCD_SCL_PIN      3
 
-#define FINGERPRINT_RX        47 
-#define FINGERPRINT_TX        48 
+#define FINGERPRINT_RX        47
+#define FINGERPRINT_TX        48
+
+// ==========================================
+// SFM-V1.7 CAPACITIVE FINGERPRINT SENSOR
+// (two extra pins besides the UART above)
+// ==========================================
+// TOUCH_OUT: HIGH while a finger is on the pad, LOW otherwise.
+// GPIO19 (USB_D-): free because flashing/monitoring happens over the
+// board's TTL USB-C port. RULE: nothing may ever be plugged into the
+// OTG USB-C port while the sensor is wired here -- OTG drives this
+// line natively, and the two outputs would fight. No strap role on
+// reset, so touch state at power-up is irrelevant (unlike GPIO0/45).
+#define FINGERPRINT_TOUCH     19
+
+// The SFM library's constructor requires a VCC control pin, but the
+// module itself is powered from the 3V3 rail -- it draws more than a
+// GPIO can source. So GPIO0 stays UNCONNECTED and only satisfies the
+// library's constructor. Do NOT swap this with the touch wire: GPIO0
+// is a boot strap that must read HIGH at reset, and TOUCH_OUT idles
+// LOW -- a finger resting on the sensor during power-up would wedge
+// the boot.
+#define FINGERPRINT_VCC       0
 
 // ==========================================
 // 4x4 KEYPAD
