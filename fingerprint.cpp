@@ -1,30 +1,63 @@
 #include <cstdint>
 #include "pins.h"
 #include "fingerprint.h"
-#include <Adafruit_Fingerprint.h>
+#include "sfm.hpp" // SFM-V1.7 library (Arduino Library Manager: "SFM-V1.7")
 
-// Sensor is a DY50 module, AS608-protocol-compatible -- default baud
-// 57600. Valid IDs are 0-126 (127 slots total), but slot 0 is
-// reserved as our internal "no match" sentinel and is never assigned
-// during enrollment -- this also matches the backend's own validation
-// (slotNumber >= 1 on all operations).
-HardwareSerial fingerSerial(1);
-Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+// Sensor is an SFM-V1.7 capacitive module -- a completely different
+// protocol from the AS608 family (the old DY50), so this file no longer
+// touches Adafruit_Fingerprint at all. Differences that shape the code
+// below:
+//   - UART is fixed at 115200 (the library opens it in its constructor).
+//   - Finger presence comes from a capacitive TOUCH_OUT pin, not from
+//     polling getImage() -- identification is a single blocking
+//     recognition_1vN() call, made only on a fresh touch.
+//   - Enrollment is THREE placements (the protocol's "3C3R") and the
+//     module assigns the user ID itself; there is no per-slot
+//     loadModel() probe, so findNextFreeSlot() is gone in favor of
+//     isSensorFull() + module-assigned IDs.
+//
+// User IDs are 1-10000 per the protocol doc; the module enforces its
+// own storage limit with ACK_FULL. The backend still calls this value
+// "slotNumber", and slot 0 stays reserved as the "no match" sentinel
+// (the module never assigns it), so checkFingerprint() > 0 remains a
+// valid match.
 
+static const int SFM_MAX_USERS = 500;
+// The datasheet's text layer doesn't state the template capacity; 500
+// is the common figure for this module family. This constant only
+// feeds the early isSensorFull() check -- the sensor itself is the
+// real gate (ACK_FULL at enrollment maps to ENROLL_NO_FREE_SLOT). If
+// the module proves to hold more, raise this or rely on ACK_FULL.
+
+static const unsigned long ENROLL_STEP_TIMEOUT_MS = 10000; // per finger removal
+
+static SFM_Module* finger = nullptr;
 static bool sensorAvailable = false;
 static const int MAX_INIT_ATTEMPTS = 3;
 static const unsigned long RETRY_DELAY_MS = 3000;
 
-static const int MAX_SLOTS = 126; // usable range is 1-126; slot 0 reserved
-
-static const unsigned long ENROLL_STEP_TIMEOUT_MS = 10000; // per finger placement
+// The library tracks touch state through a CHANGE interrupt on the
+// TOUCH_OUT pin -- without this attached, isTouched() never updates.
+static void IRAM_ATTR fingerTouchIsr() {
+  if (finger) finger->pinInterrupt();
+}
 
 bool initFingerprint(WarningCallback onRetryWarning) {
-  fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
-
   for (int attempt = 1; attempt <= MAX_INIT_ATTEMPTS; attempt++) {
-    finger.begin(57600);
-    if (finger.verifyPassword()) {
+    if (!finger) {
+      // Constructed lazily (not as a global) so the UART opens after
+      // the core is up. The constructor configures TOUCH_OUT as
+      // INPUT_PULLDOWN, drives the VCC pin HIGH (dummy -- see pins.h),
+      // and begins serial at 115200 8N1 on SFM_UART_INDEX.
+      finger = new SFM_Module(FINGERPRINT_VCC, FINGERPRINT_TOUCH,
+                              FINGERPRINT_RX, FINGERPRINT_TX, 1);
+      finger->setPinInterrupt(fingerTouchIsr);
+    }
+
+    // isConnected() exchanges a UUID packet -- the real handshake,
+    // replacing Adafruit's verifyPassword(). Slow failure path (the
+    // library's serial timeout is 8s) but bounded by MAX_INIT_ATTEMPTS.
+    if (finger->isConnected()) {
       sensorAvailable = true;
       return true;
     }
@@ -45,19 +78,33 @@ bool isFingerprintAvailable() {
 }
 
 int checkFingerprint() {
-  uint8_t p = finger.getImage();
+  if (!finger) return -1;
 
-  if (p == FINGERPRINT_NOFINGER) return 0;
-  if (p != FINGERPRINT_OK) return -1;   // real comms/sensor error
+  // One press = one identification: a rising edge on the touch pad
+  // triggers recognition_1vN(); keeping the finger down does nothing
+  // until it's lifted again. Same "no spam" behavior the old
+  // getImage() polling had, minus the busy-polling.
+  static bool wasTouched = false;
+  bool touched = finger->isTouched();
 
-  p = finger.image2Tz();
-  if (p != FINGERPRINT_OK) return -1;
+  if (!touched) {
+    wasTouched = false;
+    return 0;
+  }
+  if (wasTouched) return 0; // same press as the last poll, already handled
+  wasTouched = true;
 
-  p = finger.fingerSearch();
-  if (p == FINGERPRINT_OK) return finger.fingerID;
+  uint16_t uid = 0;
+  uint8_t p = finger->recognition_1vN(uid);
 
-  return -2; // read cleanly, but no match -- see fingerprint.h for why
-             // this is distinct from the "no finger present" 0 case
+  // Per the protocol doc: a clean read that matches nothing returns
+  // ACK_SUCCESS with ID 00 00 -- that's our -2. Everything else
+  // (image-collection timeout on a graze, comms trouble, hardware
+  // error) is a retryable -1.
+  if (p == SFM_ACK_SUCCESS) {
+    return uid > 0 ? (int)uid : -2;
+  }
+  return -1;
 }
 
 const char* enrollResultToString(EnrollResult result) {
@@ -73,77 +120,73 @@ const char* enrollResultToString(EnrollResult result) {
   }
 }
 
-int findNextFreeSlot() {
-  // Ask the sensor itself rather than tracking a local slot bitmap --
-  // this keeps the sensor as the single source of truth, so there's
-  // no way for our bookkeeping and the sensor's actual contents to
-  // drift out of sync (e.g. after a reflash or a manual sensor reset).
-  // Cost: up to MAX_SLOTS UART round-trips, but this only runs during
-  // enrollment, never in the polling loop, so it's fine.
-  for (int id = 1; id <= MAX_SLOTS; id++) {
-    if (finger.loadModel(id) != FINGERPRINT_OK) {
-      return id; // nothing stored here
-    }
-  }
-  return 0; // sensor full
+bool isSensorFull() {
+  if (!finger) return true;
+  return finger->getUserCount() >= SFM_MAX_USERS;
 }
 
-// Waits for a finger to be placed and imaged, with a timeout.
-// Returns FINGERPRINT_OK, FINGERPRINT_NOFINGER (only on timeout), or
-// a genuine sensor error code.
-static uint8_t waitForImage(EnrollPromptCallback onPrompt, const char* line1) {
-  unsigned long start = millis();
-  uint8_t p;
-  do {
-    if (onPrompt) onPrompt(line1, "");
-    p = finger.getImage();
-    if (p == FINGERPRINT_NOFINGER) {
-      if (millis() - start > ENROLL_STEP_TIMEOUT_MS) return FINGERPRINT_NOFINGER;
-      delay(50);
-      continue;
-    }
-    return p;
-  } while (true);
-}
-
-EnrollResult enrollFingerprint(int slot, EnrollPromptCallback onPrompt) {
-  if (slot < 1 || slot > MAX_SLOTS) return ENROLL_NO_FREE_SLOT;
-
-  // --- First scan ---
-  uint8_t p = waitForImage(onPrompt, "Place Finger");
-  if (p == FINGERPRINT_NOFINGER) return ENROLL_TIMEOUT;
-  if (p != FINGERPRINT_OK) return ENROLL_BAD_IMAGE;
-
-  if (finger.image2Tz(1) != FINGERPRINT_OK) return ENROLL_BAD_IMAGE;
-
+// Best-effort wait for the user to lift off after each of the first
+// two scans. Bounded, and proceeds anyway on timeout -- same lenient
+// behavior the AS608 flow had (a still-pressed finger just fails the
+// next step as a mismatch).
+static void waitUntilUntouched(EnrollPromptCallback onPrompt) {
   if (onPrompt) onPrompt("Remove Finger", "");
-  delay(1000);
-  unsigned long removeStart = millis();
-  while (finger.getImage() != FINGERPRINT_NOFINGER) {
-    if (millis() - removeStart > ENROLL_STEP_TIMEOUT_MS) break;
+  unsigned long start = millis();
+  while (finger->isTouched()) {
+    if (millis() - start > ENROLL_STEP_TIMEOUT_MS) break;
     delay(50);
   }
+  delay(500); // settling gap, mirroring the old remove-finger pause
+}
 
-  // --- Second scan ---
-  p = waitForImage(onPrompt, "Place Same Finger");
-  if (p == FINGERPRINT_NOFINGER) return ENROLL_TIMEOUT;
-  if (p != FINGERPRINT_OK) return ENROLL_BAD_IMAGE;
+EnrollResult enrollFingerprint(int &assignedUid, EnrollPromptCallback onPrompt) {
+  assignedUid = 0;
+  if (!finger) return ENROLL_STORE_FAILED;
 
-  if (finger.image2Tz(2) != FINGERPRINT_OK) return ENROLL_BAD_IMAGE;
+  // --- Scan 1 of 3 ---
+  // Passing uid 0 tells the module to auto-assign an unused ID. The
+  // module blocks inside this call until it captures a finger (or
+  // gives up with its own image-collection timeout), so no local
+  // wait-for-finger loop is needed like the AS608 flow had.
+  uint8_t p = finger->register_3c3r_1st(0);
+  if (p == SFM_ACK_TIMEOUT) return ENROLL_TIMEOUT;
+  if (p == SFM_ACK_FULL) return ENROLL_NO_FREE_SLOT;
+  if (p != SFM_ACK_SUCCESS) return ENROLL_BAD_IMAGE;
 
-  if (finger.createModel() != FINGERPRINT_OK) return ENROLL_MISMATCH;
+  waitUntilUntouched(onPrompt);
 
-  // Duplicate check -- search the existing database with this freshly
-  // created model before writing it anywhere.
-  if (finger.fingerFastSearch() == FINGERPRINT_OK) {
-    return ENROLL_DUPLICATE;
-  }
+  // --- Scan 2 of 3 ---
+  if (onPrompt) onPrompt("Place Same Finger", "");
+  p = finger->register_3c3r_2nd();
+  if (p == SFM_ACK_TIMEOUT) return ENROLL_TIMEOUT;
+  if (p == SFM_ACK_FULL) return ENROLL_NO_FREE_SLOT;
+  if (p != SFM_ACK_SUCCESS) return ENROLL_BAD_IMAGE;
 
-  if (finger.storeModel(slot) != FINGERPRINT_OK) return ENROLL_STORE_FAILED;
+  waitUntilUntouched(onPrompt);
 
+  // --- Scan 3 of 3 -- commits the template and returns the ID ---
+  if (onPrompt) onPrompt("Place Same Finger", "");
+  uint16_t uid = 0;
+  p = finger->register_3c3r_3rd(uid);
+  if (p == SFM_ACK_TIMEOUT) return ENROLL_TIMEOUT;
+  if (p != SFM_ACK_SUCCESS || uid == 0) return ENROLL_MISMATCH;
+
+  // NOTE: this protocol has no pre-store duplicate search -- the old
+  // createModel()+fingerFastSearch() trick has no SFM equivalent, and
+  // the template is committed to the database in this third step. If
+  // the module itself doesn't reject re-enrolling the same finger
+  // under a new ID, duplicate detection now relies on the backend's
+  // per-user "already_enrolled" pre-check instead. ENROLL_DUPLICATE
+  // stays in the enum purely so the backend's errorReason vocabulary
+  // is unchanged.
+
+  assignedUid = (int)uid;
   return ENROLL_OK;
 }
 
-bool deleteFingerprint(int slot) {
-  return finger.deleteModel(slot) == FINGERPRINT_OK;
+bool deleteFingerprint(int uid) {
+  if (!finger) return false;
+  // SFM_ACK_NOUSER on an empty ID also lands here as false, which the
+  // callers already surface as "slot_not_found".
+  return finger->deleteUser(uid) == SFM_ACK_SUCCESS;
 }
