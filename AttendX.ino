@@ -182,6 +182,62 @@ static const char* precheckFailureReason(PreEnrollCheck check) {
   }
 }
 
+// ---------------- device status for telemetry ----------------
+// Measured here because the UI task owns the sensor's UART; the network
+// task only ever reads the snapshot this publishes, never the sensor.
+
+static void publishDeviceStatus() {
+  int enrolled = fingerprintOK ? getSensorUserCount() : -1;
+  reportDeviceStatus(fingerprintOK, cameraOK, enrolled, getSensorCapacity());
+}
+
+// ---------------- check-in outcome ----------------
+// Shows what the BACKEND decided, not what the terminal assumed. Before
+// this, the LCD said "Welcome / Slot N" the instant a finger matched --
+// regardless of whether the backend knew the slot, who it belonged to,
+// or was even reachable.
+
+static void showCheckinOutcome(uint32_t seq) {
+  if (seq == 0) {
+    // Event queue was full, so the check-in went straight to the offline buffer.
+    display("Saved Offline", "Will Sync Later");
+    delay(2000);
+    return;
+  }
+
+  display("Checking In...", "");
+  CheckinResult r;
+  if (!waitForCheckinResult(seq, r, 8000)) {
+    // No answer yet. The network task is still delivering it, or will
+    // buffer it for retry -- either way it isn't lost.
+    display("Slow Network", "Will Sync Later");
+    delay(2000);
+    return;
+  }
+
+  if (r.delivered) {
+    const char* top = r.displayMessage[0] ? r.displayMessage : "Recorded";
+    const char* what = "";
+    if (strcmp(r.eventType, "CHECK_IN") == 0)       what = "Checked In";
+    else if (strcmp(r.eventType, "CHECK_OUT") == 0) what = "Checked Out";
+
+    char lateLine[21] = "";
+    if (r.isLate && r.lateMinutes > 0 && strcmp(r.eventType, "CHECK_IN") == 0) {
+      snprintf(lateLine, sizeof(lateLine), "Late by %d min", r.lateMinutes);
+    }
+    display(top, r.userName, what, lateLine);
+    delay(2500);
+  } else if (r.rejected) {
+    // Backend answered but refused (e.g. "SLOT NOT FOUND"). Not retried.
+    Serial.printf("Check-in rejected, HTTP %d: %s\n", r.httpCode, r.displayMessage);
+    display(r.displayMessage[0] ? r.displayMessage : "Rejected", "Not Recorded", "Ask An Admin");
+    delay(3000);
+  } else {
+    display("Saved Offline", "Will Sync Later");
+    delay(2000);
+  }
+}
+
 // ---------------- admin menu ----------------
 
 static void runAdminMenu() {
@@ -249,6 +305,7 @@ static void runAdminMenu() {
       display("Enroll Failed", enrollResultToString(result));
       queueTerminalInitiatedResult("ENROLL_FINGERPRINT", userId, 0, false, enrollResultToString(result));
     }
+    publishDeviceStatus();
     delay(2000);
 
   } else if (choice == 'B') {
@@ -266,6 +323,7 @@ static void runAdminMenu() {
     bool ok = deleteFingerprint(slot);
     display(ok ? "Deleted" : "Delete Failed", ("Slot " + String(slot)).c_str());
     queueTerminalInitiatedResult("DELETE_FINGERPRINT", "", slot, ok, ok ? nullptr : "slot_not_found");
+    publishDeviceStatus();
     delay(2000);
   }
   // 'C' or timeout: just fall through and return to idle
@@ -331,6 +389,7 @@ static void handlePendingCommand() {
       display("Enroll Failed", enrollResultToString(result));
       queueCommandResult(cmd, false, enrollResultToString(result), 0);
     }
+    publishDeviceStatus();
     delay(2000);
     showIdleScreen();
 
@@ -338,6 +397,7 @@ static void handlePendingCommand() {
     bool ok = deleteFingerprint(cmd.slotNumber);
     display(ok ? "Deleted" : "Delete Failed", ("Slot " + String(cmd.slotNumber)).c_str());
     queueCommandResult(cmd, ok, ok ? nullptr : "slot_not_found", cmd.slotNumber);
+    publishDeviceStatus();
     delay(1500);
     showIdleScreen();
   }
@@ -369,6 +429,7 @@ void setup() {
     display("Keypad Mode", "Press # for ID");
     delay(2000);
   }
+  publishDeviceStatus();
   showIdleScreen();
 }
 
@@ -387,9 +448,11 @@ void loop() {
     int slot = checkFingerprint();
     if (slot > 0) {
       leavingIdleScreen();
-      display("Welcome", ("Slot " + String(slot)).c_str());
-      queueFingerprintCheckin(slot);
-      delay(2000);
+      // No "Welcome" yet: the backend is the one that knows whose slot
+      // this is (or that it's unmapped), so wait for its answer.
+      display("Checking In...", "");
+      uint32_t seq = queueFingerprintCheckin(slot);
+      showCheckinOutcome(seq);
       handledSomething = true;
     } else if (slot == -1) {
       leavingIdleScreen();
@@ -422,15 +485,17 @@ void loop() {
         size_t photoLen;
         uint8_t* photo = capturePhoto(&photoLen);
         if (photo) {
-          display("Check-In OK", "Photo Logged");
-          queueManualCheckinWithPhoto(userId, photo, photoLen);
+          display("Checking In...", userId.c_str());
+          uint32_t seq = queueManualCheckinWithPhoto(userId, photo, photoLen);
+          showCheckinOutcome(seq);
         } else {
           display("Camera Error", "Try Again");
+          delay(2000);
         }
       } else {
         display("Camera Offline", "Cannot Log");
+        delay(2000);
       }
-      delay(2000);
     }
     handledSomething = true;
   }

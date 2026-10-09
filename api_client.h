@@ -26,6 +26,7 @@ struct OutboundEvent {
   bool offlineBuffered;
   uint8_t* photoBuf;        // heap-allocated by the caller; network task frees it
   size_t photoLen;
+  uint32_t seq;             // check-in events only: matches the CheckinResult sent back (0 = none)
 };
 
 enum IncomingCommandType { CMD_ENROLL_FINGERPRINT, CMD_DELETE_FINGERPRINT };
@@ -59,12 +60,39 @@ struct UserStatusResult {
   bool hasFingerprint;
 };
 enum PreEnrollCheck { PRECHECK_OK, PRECHECK_NOT_FOUND, PRECHECK_ALREADY_ENROLLED, PRECHECK_VERIFY_FAILED };
+
+// ---------- check-in outcome (what the backend actually decided) ----------
+//
+// Sent from the network task to the UI task after every live check-in
+// attempt, so the LCD can show the backend's real answer (resolved name,
+// late status, or the reason it was refused) instead of an optimistic
+// "Welcome". Declared in this header (not the .ino) for the same
+// Arduino auto-prototype reason as PreEnrollCheck above.
+struct CheckinResult {
+  uint32_t seq;            // matches the seq returned by queue*Checkin()
+  bool delivered;          // backend accepted it (2xx)
+  bool rejected;           // backend refused it (4xx, e.g. SLOT NOT FOUND) -- not retried
+  bool buffered;           // couldn't deliver (offline / 5xx / timeout) -- saved, will retry
+  int  httpCode;           // 0 = no HTTP response at all
+  bool isLate;
+  int  lateMinutes;
+  char eventType[12];      // "CHECK_IN" / "CHECK_OUT" when delivered
+  char userName[21];       // backend-resolved name, truncated to LCD width
+  char displayMessage[21]; // backend's own LCD text, truncated to LCD width
+};
 // Starts the network task (core 0) and creates the queues. Call once from setup().
 void initApiClient();
 
 // --- Called from the UI task (core 1) only ---
-void queueFingerprintCheckin(int slotNumber);
-void queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t photoLen);
+// Both return the seq to pass to waitForCheckinResult(), or 0 if the event
+// had to be saved straight to the offline buffer (no result will arrive).
+uint32_t queueFingerprintCheckin(int slotNumber);
+uint32_t queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t photoLen);
+
+// Blocking. Waits up to timeoutMs for the result matching `seq`. Results
+// from older, timed-out attempts are discarded. Returns false on timeout --
+// the event is still being delivered or buffered by the network task.
+bool waitForCheckinResult(uint32_t seq, CheckinResult& out, unsigned long timeoutMs);
 void queueCommandResult(const IncomingCommand& cmd, bool success, const char* errorReason, int assignedSlot);
 void queueTerminalInitiatedResult(const char* type, const String& userId, int slotNumber, bool success, const char* errorReason);
 
@@ -86,5 +114,12 @@ void reportLcdText(const char* line1, const char* line2);
 // True once NTP has completed at least one successful sync. The idle
 // screen should show a placeholder ("--:--") until this is true.
 bool isTimeSynced();
+
+#define FW_VERSION "AttendX-FW v3.1"
+
+// Call from the UI task at boot and after every enroll/delete. The network
+// task only ever reads this snapshot -- it never touches the sensor itself
+// (the sensor's UART belongs to the UI task). enrolledCount < 0 = unknown.
+void reportDeviceStatus(bool fingerprintOk, bool cameraOk, int enrolledCount, int capacity);
 
 #endif

@@ -52,6 +52,13 @@ const char* enrollResultToString(EnrollResult result);
 // enrollment with ACK_FULL, which maps to ENROLL_NO_FREE_SLOT.
 bool isSensorFull();
 
+// Sensor queries for telemetry. UART calls -- UI task only, never from
+// the network task. getSensorUserCount() returns -1 if the query fails.
+// NOTE: SFM_MAX_USERS (500) is an assumed capacity -- confirm it against
+// the SFM-V1.7 datasheet; the dashboard will show whatever is returned here.
+int getSensorUserCount();
+int getSensorCapacity();
+
 // Runs the full three-scan SFM enrollment. Blocking, with per-step
 // timeouts. Unlike the old AS608 flow, the caller does NOT pick the
 // ID: the module assigns an unused one itself and returns it via

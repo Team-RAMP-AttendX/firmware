@@ -125,6 +125,17 @@ bool isSensorFull() {
   return finger->getUserCount() >= SFM_MAX_USERS;
 }
 
+int getSensorCapacity() {
+  return SFM_MAX_USERS;
+}
+
+int getSensorUserCount() {
+  if (!finger) return -1;
+  int n = (int)finger->getUserCount();
+  if (n < 0 || n > 10000) return -1;   // implausible value: treat the query as failed
+  return n;
+}
+
 // Best-effort wait for the user to lift off after each of the first
 // two scans. Bounded, and proceeds anyway on timeout -- same lenient
 // behavior the AS608 flow had (a still-pressed finger just fails the
@@ -181,6 +192,13 @@ EnrollResult enrollFingerprint(int &assignedUid, EnrollPromptCallback onPrompt) 
   // is unchanged.
 
   assignedUid = (int)uid;
+
+  // Don't return while the finger is still on the pad. checkFingerprint()
+  // starts a recognition on every fresh touch, so a finger still resting
+  // here when the caller's "Enrolled" screen ends could be read as a
+  // brand-new touch and logged as a stray check-in for the user who was
+  // just enrolled. Bounded, and a no-op when the finger is already up.
+  waitUntilUntouched(onPrompt);
   return ENROLL_OK;
 }
 

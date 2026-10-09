@@ -17,6 +17,8 @@ static QueueHandle_t outboundQueue;
 static QueueHandle_t inboundCommandQueue;
 static QueueHandle_t userStatusRequestQueue;
 static QueueHandle_t userStatusResultQueue;
+static QueueHandle_t checkinResultQueue;      // depth 1, written with xQueueOverwrite
+static uint32_t nextCheckinSeq = 1;
 static char inProgressCommandId[COMMANDID_MAX_LEN] = "";
 static uint32_t nextBufferSeq = 1;
 static volatile bool timeSynced = false;
@@ -68,6 +70,35 @@ static void getLcdTextSnapshot(char* out1, char* out2) {
   strncpy(out1, lastLcdLine1, 21);
   strncpy(out2, lastLcdLine2, 21);
   portEXIT_CRITICAL(&lcdMux);
+}
+
+// ---------- device status snapshot (cross-core, critical-section protected) ----------
+// The UI task owns the sensor's UART, so it measures things and publishes
+// them here; the network task only ever reads this copy for telemetry.
+
+struct DeviceStatusSnapshot {
+  bool fingerprintOk;
+  bool cameraOk;
+  int enrolledCount;   // < 0 = unknown
+  int capacity;
+};
+static DeviceStatusSnapshot deviceStatus = { false, false, -1, 0 };
+static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
+
+void reportDeviceStatus(bool fingerprintOk, bool cameraOk, int enrolledCount, int capacity) {
+  portENTER_CRITICAL(&statusMux);
+  deviceStatus.fingerprintOk = fingerprintOk;
+  deviceStatus.cameraOk = cameraOk;
+  deviceStatus.enrolledCount = enrolledCount;
+  deviceStatus.capacity = capacity;
+  portEXIT_CRITICAL(&statusMux);
+}
+
+static DeviceStatusSnapshot getDeviceStatusSnapshot() {
+  portENTER_CRITICAL(&statusMux);
+  DeviceStatusSnapshot copy = deviceStatus;
+  portEXIT_CRITICAL(&statusMux);
+  return copy;
 }
 
 // ---------- command in-progress dedup ----------
@@ -212,7 +243,20 @@ static void persistJsonToBuffer(const String& url, const String& json) {
 // only a transport/5xx failure gets buffered. lastHttpCode is passed in
 // by the caller so this function doesn't need to know about HTTPClient.
 static bool isPermanentRejection(int httpCode) {
-  return httpCode >= 400 && httpCode < 500;
+  // 408 (request timeout) and 429 (rate limited) are 4xx but transient --
+  // retrying them later is correct, so they are not "permanent".
+  return httpCode >= 400 && httpCode < 500 && httpCode != 408 && httpCode != 429;
+}
+
+// Counts files waiting in the offline buffer (for telemetry's pendingRecords).
+static int countBufferedEvents() {
+  int n = 0;
+  File dir = LittleFS.open(BUFFER_DIR);
+  if (!dir) return 0;
+  File f = dir.openNextFile();
+  while (f) { n++; f = dir.openNextFile(); }
+  dir.close();
+  return n;
 }
 
 // Tries to send the single oldest buffered event. Returns true if this
@@ -323,25 +367,73 @@ static bool sendEvidencePhoto(const String& userId, const String& attendanceId,
 
 // ---------- outbound event handling ----------
 
+// Pulls only the fields the LCD needs out of a check-in response. A full
+// success reply embeds the whole attendance record array (~900 bytes);
+// a filter keeps the parse small no matter how large the reply grows.
+// Error replies carry displayMessage too (e.g. "SLOT NOT FOUND").
+static void copyTrunc(char* dst, size_t dstSize, const char* src) {
+  strncpy(dst, src, dstSize - 1);
+  dst[dstSize - 1] = '\0';
+}
+
+static void parseCheckinResponse(const String& respBody, CheckinResult& res, String* attendanceIdOut) {
+  StaticJsonDocument<192> filter;
+  filter["eventType"] = true;
+  filter["userName"] = true;
+  filter["displayMessage"] = true;
+  filter["isLate"] = true;
+  filter["lateMinutes"] = true;
+  filter["attendanceId"] = true;
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, respBody, DeserializationOption::Filter(filter));
+  if (err) {
+    Serial.printf("[checkin] response parse failed: %s\n", err.c_str());
+    return;
+  }
+  copyTrunc(res.eventType, sizeof(res.eventType), doc["eventType"] | "");
+  copyTrunc(res.userName, sizeof(res.userName), doc["userName"] | "");
+  copyTrunc(res.displayMessage, sizeof(res.displayMessage), doc["displayMessage"] | "");
+  res.isLate = doc["isLate"] | false;
+  res.lateMinutes = doc["lateMinutes"] | 0;
+  if (attendanceIdOut) *attendanceIdOut = String((const char*)(doc["attendanceId"] | ""));
+}
+
 static void handleOutboundEvent(OutboundEvent& evt) {
   bool sent = false;
+  int httpCode = -1;
   String url, body, respBody;
+  bool isCheckin = false;
+  CheckinResult res = {};
 
   if (evt.type == EVT_FINGERPRINT_CHECKIN || evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO) {
+    isCheckin = true;
     buildCheckinJson(body, evt.type, evt.userId, evt.slotNumber, evt.offlineBuffered);
     url = "https://attendx-ramp.vercel.app/api/attendance/checkin";
-    int httpCode = -1;
     sent = httpPostJson(url.c_str(), body, &respBody, &httpCode);
     Serial.printf("[checkin] HTTP %d sent=%s body=%s resp=%s\n",
                   httpCode, sent ? "true" : "false", body.c_str(), respBody.c_str());
 
-    if (sent && evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO && evt.photoBuf) {
-      StaticJsonDocument<256> respDoc;
-      deserializeJson(respDoc, respBody);
-      String attendanceId = respDoc["attendanceId"] | "";
-      if (!sendEvidencePhoto(evt.userId, attendanceId, evt.photoBuf, evt.photoLen)) {
-        Serial.println("Evidence photo failed to upload -- not retried/buffered (see design note)");
+    res.seq = evt.seq;
+    res.httpCode = httpCode;
+
+    if (sent) {
+      res.delivered = true;
+      String attendanceId = "";
+      parseCheckinResponse(respBody, res, &attendanceId);
+      // Tell the UI task right away so the LCD isn't held up by the photo upload below.
+      if (evt.seq != 0) xQueueOverwrite(checkinResultQueue, &res);
+
+      if (evt.type == EVT_MANUAL_CHECKIN_WITH_PHOTO && evt.photoBuf) {
+        if (!sendEvidencePhoto(evt.userId, attendanceId, evt.photoBuf, evt.photoLen)) {
+          Serial.println("Evidence photo failed to upload -- not retried/buffered (see design note)");
+        }
       }
+    } else if (isPermanentRejection(httpCode)) {
+      res.rejected = true;
+      parseCheckinResponse(respBody, res, nullptr);
+    } else {
+      res.buffered = true;
     }
   } else if (evt.type == EVT_COMMAND_RESULT) {
     StaticJsonDocument<256> doc;
@@ -357,7 +449,6 @@ static void handleOutboundEvent(OutboundEvent& evt) {
 
     url = "https://attendx-ramp.vercel.app/api/devices/commands/result";
     serializeJson(doc, body);
-    int httpCode = -1;
     sent = httpPostJson(url.c_str(), body, &respBody, &httpCode);
     Serial.printf("[commands/result] HTTP %d sent=%s body=%s resp=%s\n",
                   httpCode, sent ? "true" : "false", body.c_str(), respBody.c_str());
@@ -367,7 +458,16 @@ static void handleOutboundEvent(OutboundEvent& evt) {
   }
 
   if (!sent) {
-    persistJsonToBuffer(url, body);
+    if (isPermanentRejection(httpCode)) {
+      // The backend said no and will keep saying no -- buffering it would
+      // just retry a doomed request until the drain loop drops it anyway.
+      Serial.printf("Event permanently rejected (HTTP %d), not buffered\n", httpCode);
+    } else {
+      persistJsonToBuffer(url, body);
+    }
+    // Result goes out AFTER the buffer write, so "Saved Offline" on the
+    // LCD is only ever shown once it is actually saved.
+    if (isCheckin && evt.seq != 0) xQueueOverwrite(checkinResultQueue, &res);
   }
 
   if (evt.photoBuf) free(evt.photoBuf);
@@ -421,14 +521,38 @@ bool queryUserStatus(const String& userId, UserStatusResult& outResult, unsigned
 // ---------- telemetry + command retrieval ----------
 
 static void doTelemetryTick(const char* lcdLine1, const char* lcdLine2) {
-  StaticJsonDocument<256> reqDoc;
+  // Sized up from 256: the extra status fields below would not fit.
+  StaticJsonDocument<1024> reqDoc;
   reqDoc["deviceId"] = deviceId;
   reqDoc["wifiStatus"] = "Connected";
   reqDoc["rssi"] = WiFi.RSSI();
   reqDoc["ipAddress"] = WiFi.localIP().toString();
+  reqDoc["macAddress"] = WiFi.macAddress();
   reqDoc["powerStatus"] = "AC";
   reqDoc["batteryStatus"] = 100;
+  reqDoc["voltage"] = "N/A (AC)";   // not measured -- better than the backend's invented "4.15V (Li-ion)"
   reqDoc["esp32Heap"] = String(ESP.getFreeHeap() / 1024) + " KB Free";
+  reqDoc["firmwareVersion"] = FW_VERSION;
+  reqDoc["pendingRecords"] = countBufferedEvents();   // offline-buffer depth
+
+  // Real sensor/camera state. Without these the backend fills in its own
+  // hard-coded defaults ("DY50 Ready", 300 slots, ...), which stop being
+  // true the moment the sensor is offline or swapped.
+  DeviceStatusSnapshot st = getDeviceStatusSnapshot();
+  if (st.fingerprintOk) {
+    char fpStatus[48];
+    if (st.enrolledCount >= 0) snprintf(fpStatus, sizeof(fpStatus), "SFM-V1.7 Ready (%d/%d)", st.enrolledCount, st.capacity);
+    else                       snprintf(fpStatus, sizeof(fpStatus), "SFM-V1.7 Ready");
+    reqDoc["fingerprintStatus"] = fpStatus;
+  } else {
+    reqDoc["fingerprintStatus"] = "SFM-V1.7 OFFLINE (keypad-only mode)";
+  }
+  reqDoc["cameraStatus"] = st.cameraOk ? "OV2640 Ready" : "OV2640 OFFLINE";
+  if (st.capacity > 0) reqDoc["maxSlots"] = st.capacity;
+  if (st.enrolledCount >= 0) {
+    reqDoc["enrolledFingerprints"] = st.enrolledCount;
+    if (st.capacity > 0) reqDoc["freeSlots"] = st.capacity - st.enrolledCount;
+  }
   JsonArray lcd = reqDoc.createNestedArray("lcdText");
   lcd.add(lcdLine1);
   lcd.add(lcdLine2);
@@ -527,6 +651,7 @@ void initApiClient() {
   inboundCommandQueue = xQueueCreate(3, sizeof(IncomingCommand));
   userStatusRequestQueue = xQueueCreate(1, sizeof(UserStatusRequest));
   userStatusResultQueue = xQueueCreate(1, sizeof(UserStatusResult));
+  checkinResultQueue = xQueueCreate(1, sizeof(CheckinResult));   // depth 1: xQueueOverwrite keeps only the latest
 
   xTaskCreatePinnedToCore(
     networkTaskFn,
@@ -539,23 +664,29 @@ void initApiClient() {
   );
 }
 
-void queueFingerprintCheckin(int slotNumber) {
+uint32_t queueFingerprintCheckin(int slotNumber) {
   OutboundEvent evt = {};
   evt.type = EVT_FINGERPRINT_CHECKIN;
   evt.slotNumber = slotNumber;
+  evt.seq = nextCheckinSeq++;
+  xQueueReset(checkinResultQueue);   // drop any stale result from an earlier attempt
   if (xQueueSend(outboundQueue, &evt, 0) != pdTRUE) {
     String body;
     buildCheckinJson(body, EVT_FINGERPRINT_CHECKIN, "", slotNumber, true);
     persistJsonToBuffer("https://attendx-ramp.vercel.app/api/attendance/checkin", body);
+    return 0;   // saved straight to the buffer; no result will arrive
   }
+  return evt.seq;
 }
 
-void queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t photoLen) {
+uint32_t queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t photoLen) {
   OutboundEvent evt = {};
   evt.type = EVT_MANUAL_CHECKIN_WITH_PHOTO;
   strncpy(evt.userId, userId.c_str(), USERID_MAX_LEN - 1);
   evt.photoBuf = photoBuf;
   evt.photoLen = photoLen;
+  evt.seq = nextCheckinSeq++;
+  xQueueReset(checkinResultQueue);
   if (xQueueSend(outboundQueue, &evt, 0) != pdTRUE) {
     // Queue full: still buffer the check-in itself, even though the
     // photo can't be retried offline -- losing the whole event here
@@ -564,7 +695,19 @@ void queueManualCheckinWithPhoto(const String& userId, uint8_t* photoBuf, size_t
     buildCheckinJson(body, EVT_MANUAL_CHECKIN_WITH_PHOTO, userId.c_str(), 0, true);
     persistJsonToBuffer("https://attendx-ramp.vercel.app/api/attendance/checkin", body);
     free(photoBuf);
+    return 0;
   }
+  return evt.seq;
+}
+
+bool waitForCheckinResult(uint32_t seq, CheckinResult& out, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    unsigned long remaining = timeoutMs - (millis() - start);
+    if (xQueueReceive(checkinResultQueue, &out, pdMS_TO_TICKS(remaining)) != pdTRUE) break;
+    if (out.seq == seq) return true;   // anything else is a stale result from an older attempt
+  }
+  return false;
 }
 
 void queueCommandResult(const IncomingCommand& cmd, bool success, const char* errorReason, int assignedSlot) {
