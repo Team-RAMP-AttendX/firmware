@@ -143,11 +143,22 @@ EnrollResult enrollFingerprint(int &assignedUid, EnrollPromptCallback onPrompt) 
   assignedUid = 0;
   if (!finger) return ENROLL_STORE_FAILED;
 
+  // --- Wait for finger before Scan 1 ---
+  // The SFM-V1.7 does NOT block waiting for a finger the way the old
+  // AS608 did -- it rejects quickly with ACK_FAIL / ACK_IMGERROR when
+  // no finger is present, which mapped to ENROLL_BAD_IMAGE every time.
+  // Explicitly wait for the capacitive touch pad to detect a finger
+  // before sending the register command, same as Scans 2 and 3 already
+  // prompt "Place Same Finger" before their calls.
+  if (onPrompt) onPrompt("Place Finger", "");
+  unsigned long waitStart = millis();
+  while (!finger->isTouched()) {
+    if (millis() - waitStart > ENROLL_STEP_TIMEOUT_MS) return ENROLL_TIMEOUT;
+    delay(50);
+  }
+
   // --- Scan 1 of 3 ---
-  // Passing uid 0 tells the module to auto-assign an unused ID. The
-  // module blocks inside this call until it captures a finger (or
-  // gives up with its own image-collection timeout), so no local
-  // wait-for-finger loop is needed like the AS608 flow had.
+  // Passing uid 0 tells the module to auto-assign an unused ID.
   uint8_t p = finger->register_3c3r_1st(0);
   if (p == SFM_ACK_TIMEOUT) return ENROLL_TIMEOUT;
   if (p == SFM_ACK_FULL) return ENROLL_NO_FREE_SLOT;

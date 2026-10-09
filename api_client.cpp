@@ -429,6 +429,7 @@ static void doTelemetryTick(const char* lcdLine1, const char* lcdLine2) {
   reqDoc["powerStatus"] = "AC";
   reqDoc["batteryStatus"] = 100;
   reqDoc["esp32Heap"] = String(ESP.getFreeHeap() / 1024) + " KB Free";
+  reqDoc["firmwareVersion"] = "AttendX-FW V3.1";
   JsonArray lcd = reqDoc.createNestedArray("lcdText");
   lcd.add(lcdLine1);
   lcd.add(lcdLine2);
